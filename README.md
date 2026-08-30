@@ -196,6 +196,7 @@ RUN dnf update -y && \
         libicu libxml2 openssl libuuid krb5-libs \
         geos proj gdal json-c protobuf-c sqlite-libs \
         freetds \
+        glibc-langpack-en \
         shadow-utils && \
     dnf clean all && \
     rm -rf /var/cache/dnf
@@ -206,21 +207,24 @@ RUN dnf update -y && \
 # Раз вся база — EL-семейство, используем нативную нумерацию. В минимальном
 # almalinux:9 сам пакет postgresql-server не установлен, поэтому UID 26 в
 # /etc/passwd ещё не занят — но зарезервирован пакетом setup, так что useradd
-# отработает без конфликтов.
+# отработает без конфликтов. home-dir — отдельно от PGDATA, чисто для
+# shell/профиля пользователя, соответствует конвенции пакета postgresql-server.
 RUN groupadd -r postgres --gid=26 && \
-    useradd -r -g postgres --uid=26 --home-dir=/var/lib/postgresql --shell=/bin/bash postgres && \
-    mkdir -p /var/lib/postgresql/data && \
-    chown -R postgres:postgres /var/lib/postgresql
+    useradd -r -g postgres --uid=26 --home-dir=/var/lib/pgsql --shell=/bin/bash postgres && \
+    mkdir -p /var/storage/pgsql/data && \
+    chown -R postgres:postgres /var/storage/pgsql
 
 COPY --from=builder /opt/postgres /opt/postgres
 
 ENV PATH="/opt/postgres/bin:${PATH}"
-ENV PGDATA=/var/lib/postgresql/data
+ENV PGDATA=/var/storage/pgsql/data
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-VOLUME ["/var/lib/postgresql/data"]
+VOLUME ["/var/storage/pgsql/data"]
 
 EXPOSE 5432 1433
 
@@ -241,7 +245,8 @@ CMD ["postgres"]
 - PostGIS и tds_fdw собираются через PGXS против нашего собственного движка (`--with-pgconfig`/`PG_CONFIG=/opt/postgres/bin/pg_config`), а не системного `postgres` — иначе расширения попадут не туда.
 - `-DENABLE_TDS_LIB` и `SHLIB_LINK='-lsybdb -L/usr/lib64'` при сборке `babelfishpg_tsql` — обязательное условие для поддержки linked servers через tds_fdw; без этого флага расширение соберётся, но T-SQL код, обращающийся к linked server, будет падать с ошибкой.
 - Runtime-образ не содержит компиляторов и dev-заголовков (только рантайм-версии `geos`/`proj`/`gdal`/`freetds` без `-devel`) — меньше размер и площадь атаки.
-- Контейнер работает от непривилегированного пользователя `postgres` (uid/gid 26 — стандарт для EL-дистрибутивов) — соответствует нумерации, которую использует пакет `postgresql-server` в самом AlmaLinux.
+- Контейнер работает от непривилегированного пользователя `postgres` (uid/gid 26 — стандарт для EL-дистрибутивов), с домашним каталогом `/var/lib/pgsql` (RHEL-конвенция) отдельно от `PGDATA=/var/storage/pgsql/data` — соответствует нумерации и структуре, которую использует пакет `postgresql-server` в самом AlmaLinux.
+- `glibc-langpack-en` в runtime и `ENV LANG=en_US.UTF-8`/`LC_ALL=en_US.UTF-8` — без этого пакета `initdb --locale=en_US.UTF-8` в `entrypoint.sh` (раздел 4) упадёт на минимальном образе, где эта локаль не сгенерирована.
 - `HEALTHCHECK` в самом образе — это дополнение, а не замена `HealthCmd=` в Quadlet-юните (раздел 8 полного гайда): Quadlet-версия управляется systemd и видна в `systemctl status`, встроенная в образ — работает независимо от способа запуска контейнера.
 
 ## 4. Entrypoint-скрипт инициализации
@@ -251,7 +256,7 @@ CMD ["postgres"]
 #!/bin/bash
 set -euo pipefail
 
-PGDATA="${PGDATA:-/var/lib/postgresql/data}"
+PGDATA="${PGDATA:-/var/storage/pgsql/data}"
 POSTGRES_PASSWORD="${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}"
 BABELFISH_USER="${BABELFISH_USER:-babelfish_user}"
 BABELFISH_PASS="${BABELFISH_PASS:-$POSTGRES_PASSWORD}"
@@ -262,19 +267,25 @@ ENABLE_TDS_FDW="${ENABLE_TDS_FDW:-true}"
 
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
     echo "[entrypoint] Инициализация нового кластера в $PGDATA"
-    initdb -D "$PGDATA" --username=postgres --pwfile=<(echo "$POSTGRES_PASSWORD")
+    initdb -D "$PGDATA" --username=postgres --pwfile=<(echo "$POSTGRES_PASSWORD") \
+        --encoding=UTF8 --locale=en_US.UTF-8
 
     {
         echo "listen_addresses = '*'"
-        echo "shared_preload_libraries = 'babelfishpg_tds'"
+        echo "shared_preload_libraries = 'babelfishpg_tds, babelfishpg_tsql'"
+        echo "babelfishpg_tds.listen_addresses = '0.0.0.0'"
+        echo "babelfishpg_tds.port = 1433"
     } >> "$PGDATA/postgresql.conf"
 
     echo "host all all 0.0.0.0/0 scram-sha-256" >> "$PGDATA/pg_hba.conf"
 
     pg_ctl -D "$PGDATA" -o "-c listen_addresses='localhost'" -w start
 
-    psql -v ON_ERROR_STOP=1 --username postgres <<-SQL
-        CREATE USER ${BABELFISH_USER} WITH CREATEDB CREATEROLE PASSWORD '${BABELFISH_PASS}' INHERIT;
+    # Пароль передаётся через psql-переменную (--set + :'pw'), а не подставляется
+    # напрямую в SQL-строку — иначе пароль с одинарной кавычкой сломает синтаксис
+    # или откроет SQL-инъекцию в собственном bootstrap-скрипте.
+    psql -v ON_ERROR_STOP=1 --username postgres --set pw="${BABELFISH_PASS}" <<-SQL
+        CREATE USER ${BABELFISH_USER} WITH CREATEDB CREATEROLE PASSWORD :'pw' INHERIT;
         DROP DATABASE IF EXISTS ${BABELFISH_DB};
         CREATE DATABASE ${BABELFISH_DB} OWNER ${BABELFISH_USER};
 SQL
@@ -321,6 +332,8 @@ exec "$@" -D "$PGDATA"
 
 Обратите внимание: `CREATE EXTENSION tds_fdw` только регистрирует сам foreign data wrapper — сервер и логин для конкретного linked server (`CREATE SERVER ... FOREIGN DATA WRAPPER tds_fdw`, `CREATE USER MAPPING ...`) нужно создавать вручную под свои реквизиты подключения, автоматизировать это в entrypoint нельзя — целевой сервер и его учётные данные заранее не известны.
 
+**Про `--encoding=UTF8 --locale=en_US.UTF-8`:** минимальный `almalinux:9` может не иметь этой локали сгенерированной, поэтому в runtime-этапе `Containerfile` (раздел 3) обязательно должен стоять пакет `glibc-langpack-en` — без него `initdb` с этим флагом упадёт. Ниже в разделе 3 он уже добавлен.
+
 ```bash
 chmod +x entrypoint.sh
 ```
@@ -344,6 +357,10 @@ sudo podman build -t localhost/babelfish:5.4.0-pg17.7 \
 
 ```bash
 sudo mkdir -p /var/storage/pgsql/data
+sudo chown 26:26 /var/storage/pgsql/data   # UID/GID postgres внутри контейнера (раздел 3) —
+                                             # без этого initdb упадёт с Permission denied,
+                                             # т.к. контейнер пишет от непривилегированного
+                                             # пользователя, а не от root
 sudo chmod 750 /var/storage/pgsql/data
 ```
 
@@ -387,8 +404,10 @@ Network=babelfish-net.network
 PublishPort=1433:1433
 PublishPort=127.0.0.1:5432:5432
 
-# Данные — постоянный volume с корректной SELinux-меткой
-Volume=/var/storage/pgsql/data:/var/lib/postgresql/data:Z
+# Данные — постоянный volume с корректной SELinux-меткой. Путь одинаковый
+# на хосте и внутри контейнера (совпадает с PGDATA из Containerfile,
+# см. раздел 3) — меньше путаницы при отладке.
+Volume=/var/storage/pgsql/data:/var/storage/pgsql/data:Z
 
 EnvironmentFile=/etc/babelfish/babelfish.env
 Environment=BABELFISH_USER=babelfish_user
@@ -597,7 +616,15 @@ sudo podman healthcheck run babelfish
 
 ---
 
-### Итог: сравнение трёх подходов
+## Открытые вопросы перед сборкой (не подтверждено на 100%)
+
+Ниже — то, что требует вашей проверки/решения перед первым `podman build`, а не автоматически исправлено в этом гайде:
+
+1. **Разные git-теги для двух репозиториев.** Если решите использовать раздельные `PG_BABEL_TAG`/`EXT_BABEL_TAG` (по образцу вашего варианта) вместо единого `BABEL_TAG` для обоих `git clone` — сначала проверьте на GitHub, что оба тега реально существуют в соответствующих репозиториях для нужной версии (`postgresql_modified_for_babelfish` и `babelfish_extensions`). Иначе `git clone --branch` просто упадёт с "not found" на этапе сборки.
+2. **Включение PostGIS/tds_fdw в БД по умолчанию.** Сейчас `entrypoint.sh` делает `CREATE EXTENSION` автоматически (управляется `ENABLE_POSTGIS`/`ENABLE_TDS_FDW`). Если хотите включать вручную под конкретную задачу — поменяйте дефолт на `false` или уберите блоки из `entrypoint.sh`.
+3. **`babelfishpg_tsql.database_name`.** В этом гайде GUC выставляется через `ALTER SYSTEM` и `pg_reload_conf()`. Существует альтернативный подход — вообще не задавать этот GUC и полагаться только на `migration_mode`; я не нашёл однозначного авторитетного источника, что один из вариантов строго обязателен для конкретно вашей версии Babelfish. Если после инициализации TDS-подключения не находят нужную базу — это первое, что стоит перепроверить в документации к вашей версии.
+
+
 
 | Подход | Время первой настройки | Обслуживание | Контроль |
 |---|---|---|---|
