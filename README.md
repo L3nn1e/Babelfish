@@ -53,6 +53,7 @@ AlmaLinux 9 практически идентичен по toolchain'у Ubuntu 2
 /opt/babelfish-image/
 ├── Containerfile
 ├── entrypoint.sh
+├── healthcheck.sh
 └── postgresql.conf.tmpl   (опционально, свой шаблон конфига)
 ```
 
@@ -201,6 +202,10 @@ RUN dnf update -y && \
     dnf clean all && \
     rm -rf /var/cache/dnf
 
+# Явная генерация локали поверх пакета glibc-langpack-en — защита на случай,
+# если RPM-триггер генерации локали почему-то не сработал в минимальном образе.
+RUN localedef -c -f UTF-8 -i en_US en_US.UTF-8 || true
+
 # Пользователь без прав root для запуска postgres
 # UID/GID 26 — исторически закреплены за postgres в Fedora/RHEL/AlmaLinux
 # (пакет postgresql-server), в отличие от Debian/Ubuntu, где принято 999/70.
@@ -222,7 +227,8 @@ ENV LANG=en_US.UTF-8
 ENV LC_ALL=en_US.UTF-8
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+COPY healthcheck.sh /usr/local/bin/healthcheck.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/healthcheck.sh
 
 VOLUME ["/var/storage/pgsql/data"]
 
@@ -230,9 +236,9 @@ EXPOSE 5432 1433
 
 # Встроенный healthcheck на уровне самого образа — работает даже если контейнер
 # запущен не через Quadlet (например, при разовом podman run в ходе отладки).
-# Использует переменные окружения, заданные при старте контейнера.
+# Логика вынесена в отдельный скрипт (раздел 4.1) — читаемее, чем длинный inline CMD.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD pg_isready -U "${BABELFISH_USER:-babelfish_user}" -d "${BABELFISH_DB:-babelfish_db}" || exit 1
+    CMD /usr/local/bin/healthcheck.sh
 
 USER postgres
 ENTRYPOINT ["entrypoint.sh"]
@@ -265,8 +271,13 @@ BABELFISH_MIGRATION_MODE="${BABELFISH_MIGRATION_MODE:-single-db}"
 ENABLE_POSTGIS="${ENABLE_POSTGIS:-true}"
 ENABLE_TDS_FDW="${ENABLE_TDS_FDW:-true}"
 
-if [ ! -s "$PGDATA/PG_VERSION" ]; then
+init_db() {
     echo "[entrypoint] Инициализация нового кластера в $PGDATA"
+
+    # Пароль суперпользователя ставится сразу при initdb через --pwfile (файловый
+    # дескриптор процесса, не аргумент командной строки — не светится в ps/логах).
+    # Так пароль известен серверу с первого момента его существования — не нужно
+    # отдельно подключаться и делать ALTER USER до/после старта.
     initdb -D "$PGDATA" --username=postgres --pwfile=<(echo "$POSTGRES_PASSWORD") \
         --encoding=UTF8 --locale=en_US.UTF-8
 
@@ -279,7 +290,10 @@ if [ ! -s "$PGDATA/PG_VERSION" ]; then
 
     echo "host all all 0.0.0.0/0 scram-sha-256" >> "$PGDATA/pg_hba.conf"
 
-    pg_ctl -D "$PGDATA" -o "-c listen_addresses='localhost'" -w start
+    pg_ctl -D "$PGDATA" -o "-c listen_addresses='localhost'" -w start || {
+        echo "[entrypoint] Не удалось запустить PostgreSQL"
+        exit 1
+    }
 
     # Пароль передаётся через psql-переменную (--set + :'pw'), а не подставляется
     # напрямую в SQL-строку — иначе пароль с одинарной кавычкой сломает синтаксис
@@ -319,8 +333,14 @@ SQL
         CALL SYS.INITIALIZE_BABELFISH('${BABELFISH_USER}');
 SQL
 
-    pg_ctl -D "$PGDATA" -m fast -w stop
+    if pg_ctl -D "$PGDATA" status >/dev/null 2>&1; then
+        pg_ctl -D "$PGDATA" -m fast -w stop
+    fi
     echo "[entrypoint] Инициализация завершена"
+}
+
+if [ ! -s "$PGDATA/PG_VERSION" ]; then
+    init_db
 else
     echo "[entrypoint] Существующий кластер обнаружен в $PGDATA, инициализация пропущена"
 fi
@@ -332,11 +352,30 @@ exec "$@" -D "$PGDATA"
 
 Обратите внимание: `CREATE EXTENSION tds_fdw` только регистрирует сам foreign data wrapper — сервер и логин для конкретного linked server (`CREATE SERVER ... FOREIGN DATA WRAPPER tds_fdw`, `CREATE USER MAPPING ...`) нужно создавать вручную под свои реквизиты подключения, автоматизировать это в entrypoint нельзя — целевой сервер и его учётные данные заранее не известны.
 
-**Про `--encoding=UTF8 --locale=en_US.UTF-8`:** минимальный `almalinux:9` может не иметь этой локали сгенерированной, поэтому в runtime-этапе `Containerfile` (раздел 3) обязательно должен стоять пакет `glibc-langpack-en` — без него `initdb` с этим флагом упадёт. Ниже в разделе 3 он уже добавлен.
+**Важно про порядок:** пароль суперпользователя ставится через `--pwfile` **на этапе `initdb`**, до какого-либо `psql`-подключения. Не пытайтесь переставить это на `ALTER USER postgres PASSWORD ...` через `psql` сразу после `initdb`, но до `pg_ctl start` — сервер в этот момент ещё не запущен, `psql` не сможет подключиться, скрипт упадёт на `set -e`, а `PG_VERSION` к этому моменту уже будет создан — при следующем перезапуске контейнера entrypoint решит, что кластер уже проинициализирован, и молча пропустит весь блок (без пароля, без `shared_preload_libraries`, без TDS). Это состояние трудно диагностировать и ещё сложнее откатить без потери данных.
+
+**Про `--encoding=UTF8 --locale=en_US.UTF-8`:** минимальный `almalinux:9` может не иметь этой локали сгенерированной, поэтому в runtime-этапе `Containerfile` (раздел 3) обязательно должен стоять пакет `glibc-langpack-en` (и, для подстраховки, явный `localedef`) — без этого `initdb` с этим флагом упадёт. Ниже в разделе 3 это уже добавлено.
 
 ```bash
 chmod +x entrypoint.sh
 ```
+
+### 4.1. `healthcheck.sh`
+
+Логика healthcheck вынесена в отдельный файл вместо длинной inline-команды в `HEALTHCHECK` — легче читать и менять отдельно от остального `Containerfile`.
+
+```bash
+#!/bin/bash
+set -e
+pg_isready -U "${BABELFISH_USER:-babelfish_user}" -d "${BABELFISH_DB:-babelfish_db}" || exit 1
+```
+
+`set -e` тут не спасает от ненулевого кода самого `pg_isready` внутри `||`-конструкции (проверка в условии не считается "падением" для `set -e`) — поэтому явный `exit 1` обязателен, просто полагаться на `set -e` было бы недостаточно.
+
+```bash
+chmod +x healthcheck.sh
+```
+
 
 ## 5. Сборка образа
 
@@ -596,11 +635,11 @@ Environment=ENABLE_TDS_FDW=false
 
 ## 11. Healthcheck (уже встроено)
 
-В `Containerfile` (раздел 3) добавлена нативная инструкция `HEALTHCHECK`:
+В `Containerfile` (раздел 3) добавлена нативная инструкция `HEALTHCHECK`, вызывающая отдельный скрипт `healthcheck.sh` (раздел 4.1) вместо длинной inline-команды:
 
 ```dockerfile
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD pg_isready -U "${BABELFISH_USER:-babelfish_user}" -d "${BABELFISH_DB:-babelfish_db}" || exit 1
+    CMD /usr/local/bin/healthcheck.sh
 ```
 
 Это дополняет, а не заменяет `HealthCmd=`/`HealthInterval=`/... в самом Quadlet-юните (раздел 8 полного гайда `babelfish-quadlet-full-guide.md`):
