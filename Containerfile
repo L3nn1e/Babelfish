@@ -125,6 +125,7 @@ RUN dnf update -y && \
         libicu libxml2 openssl libuuid krb5-libs \
         geos proj gdal json-c protobuf-c sqlite-libs \
         freetds \
+        glibc-langpack-en \
         shadow-utils && \
     dnf clean all && \
     rm -rf /var/cache/dnf
@@ -135,21 +136,24 @@ RUN dnf update -y && \
 # Раз вся база — EL-семейство, используем нативную нумерацию. В минимальном
 # almalinux:9 сам пакет postgresql-server не установлен, поэтому UID 26 в
 # /etc/passwd ещё не занят — но зарезервирован пакетом setup, так что useradd
-# отработает без конфликтов.
+# отработает без конфликтов. home-dir — отдельно от PGDATA, чисто для
+# shell/профиля пользователя, соответствует конвенции пакета postgresql-server.
 RUN groupadd -r postgres --gid=26 && \
-    useradd -r -g postgres --uid=26 --home-dir=/var/lib/postgresql --shell=/bin/bash postgres && \
-    mkdir -p /var/lib/postgresql/data && \
-    chown -R postgres:postgres /var/lib/postgresql
+    useradd -r -g postgres --uid=26 --home-dir=/var/lib/pgsql --shell=/bin/bash postgres && \
+    mkdir -p /var/storage/pgsql/data && \
+    chown -R postgres:postgres /var/storage/pgsql
 
 COPY --from=builder /opt/postgres /opt/postgres
 
 ENV PATH="/opt/postgres/bin:${PATH}"
-ENV PGDATA=/var/lib/postgresql/data
+ENV PGDATA=/var/storage/pgsql/data
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-VOLUME ["/var/lib/postgresql/data"]
+VOLUME ["/var/storage/pgsql/data"]
 
 EXPOSE 5432 1433
 
