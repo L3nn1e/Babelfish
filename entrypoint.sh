@@ -10,8 +10,13 @@ BABELFISH_MIGRATION_MODE="${BABELFISH_MIGRATION_MODE:-single-db}"
 ENABLE_POSTGIS="${ENABLE_POSTGIS:-true}"
 ENABLE_TDS_FDW="${ENABLE_TDS_FDW:-true}"
 
-if [ ! -s "$PGDATA/PG_VERSION" ]; then
+init_db() {
     echo "[entrypoint] Инициализация нового кластера в $PGDATA"
+
+    # Пароль суперпользователя ставится сразу при initdb через --pwfile (файловый
+    # дескриптор процесса, не аргумент командной строки — не светится в ps/логах).
+    # Так пароль известен серверу с первого момента его существования — не нужно
+    # отдельно подключаться и делать ALTER USER до/после старта.
     initdb -D "$PGDATA" --username=postgres --pwfile=<(echo "$POSTGRES_PASSWORD") \
         --encoding=UTF8 --locale=en_US.UTF-8
 
@@ -24,7 +29,10 @@ if [ ! -s "$PGDATA/PG_VERSION" ]; then
 
     echo "host all all 0.0.0.0/0 scram-sha-256" >> "$PGDATA/pg_hba.conf"
 
-    pg_ctl -D "$PGDATA" -o "-c listen_addresses='localhost'" -w start
+    pg_ctl -D "$PGDATA" -o "-c listen_addresses='localhost'" -w start || {
+        echo "[entrypoint] Не удалось запустить PostgreSQL"
+        exit 1
+    }
 
     # Пароль передаётся через psql-переменную (--set + :'pw'), а не подставляется
     # напрямую в SQL-строку — иначе пароль с одинарной кавычкой сломает синтаксис
@@ -64,8 +72,14 @@ SQL
         CALL SYS.INITIALIZE_BABELFISH('${BABELFISH_USER}');
 SQL
 
-    pg_ctl -D "$PGDATA" -m fast -w stop
+    if pg_ctl -D "$PGDATA" status >/dev/null 2>&1; then
+        pg_ctl -D "$PGDATA" -m fast -w stop
+    fi
     echo "[entrypoint] Инициализация завершена"
+}
+
+if [ ! -s "$PGDATA/PG_VERSION" ]; then
+    init_db
 else
     echo "[entrypoint] Существующий кластер обнаружен в $PGDATA, инициализация пропущена"
 fi
