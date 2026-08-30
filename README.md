@@ -368,9 +368,14 @@ sudo chmod 750 /var/storage/pgsql/data
 
 ```bash
 sudo install -d -m 700 /etc/babelfish
-sudo bash -c 'echo "POSTGRES_PASSWORD=$(openssl rand -base64 24)" > /etc/babelfish/babelfish.env'
+sudo bash -c '{
+    echo "POSTGRES_PASSWORD=$(openssl rand -base64 24)"
+    echo "BABELFISH_PASS=$(openssl rand -base64 24)"
+} > /etc/babelfish/babelfish.env'
 sudo chmod 600 /etc/babelfish/babelfish.env
 ```
+
+Два независимых пароля, а не один общий: `POSTGRES_PASSWORD` — суперпользователь `postgres` внутри кластера, `BABELFISH_PASS` — прикладной логин (`BABELFISH_USER`, по умолчанию `babelfish_user`), которым реально будут подключаться приложения по TDS. Если задать только `POSTGRES_PASSWORD`, `entrypoint.sh` по умолчанию использует его же и для `BABELFISH_PASS` (см. раздел 4) — так что разделение строго опционально, но раз утечка пароля приложения не должна означать утечку пароля суперпользователя БД, разумно их развести.
 
 (Более строгий вариант — через `podman secret` — см. `babelfish-quadlet-full-guide.md`.)
 
@@ -464,7 +469,7 @@ sudo firewall-cmd --reload
 ### 6.7. Проверка подключения
 
 ```bash
-tsql -H <IP-сервера> -p 1433 -U babelfish_user -P '<пароль из /etc/babelfish/babelfish.env>'
+tsql -H <IP-сервера> -p 1433 -U babelfish_user -P '<значение BABELFISH_PASS из /etc/babelfish/babelfish.env>'
 ```
 
 ### 6.8. Что дальше
