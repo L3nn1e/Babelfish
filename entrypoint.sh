@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-PGDATA="${PGDATA:-/var/lib/postgresql/data}"
+PGDATA="${PGDATA:-/var/storage/pgsql/data}"
 POSTGRES_PASSWORD="${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}"
 BABELFISH_USER="${BABELFISH_USER:-babelfish_user}"
 BABELFISH_PASS="${BABELFISH_PASS:-$POSTGRES_PASSWORD}"
@@ -12,19 +12,25 @@ ENABLE_TDS_FDW="${ENABLE_TDS_FDW:-true}"
 
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
     echo "[entrypoint] Инициализация нового кластера в $PGDATA"
-    initdb -D "$PGDATA" --username=postgres --pwfile=<(echo "$POSTGRES_PASSWORD")
+    initdb -D "$PGDATA" --username=postgres --pwfile=<(echo "$POSTGRES_PASSWORD") \
+        --encoding=UTF8 --locale=en_US.UTF-8
 
     {
         echo "listen_addresses = '*'"
-        echo "shared_preload_libraries = 'babelfishpg_tds'"
+        echo "shared_preload_libraries = 'babelfishpg_tds, babelfishpg_tsql'"
+        echo "babelfishpg_tds.listen_addresses = '0.0.0.0'"
+        echo "babelfishpg_tds.port = 1433"
     } >> "$PGDATA/postgresql.conf"
 
     echo "host all all 0.0.0.0/0 scram-sha-256" >> "$PGDATA/pg_hba.conf"
 
     pg_ctl -D "$PGDATA" -o "-c listen_addresses='localhost'" -w start
 
-    psql -v ON_ERROR_STOP=1 --username postgres <<-SQL
-        CREATE USER ${BABELFISH_USER} WITH CREATEDB CREATEROLE PASSWORD '${BABELFISH_PASS}' INHERIT;
+    # Пароль передаётся через psql-переменную (--set + :'pw'), а не подставляется
+    # напрямую в SQL-строку — иначе пароль с одинарной кавычкой сломает синтаксис
+    # или откроет SQL-инъекцию в собственном bootstrap-скрипте.
+    psql -v ON_ERROR_STOP=1 --username postgres --set pw="${BABELFISH_PASS}" <<-SQL
+        CREATE USER ${BABELFISH_USER} WITH CREATEDB CREATEROLE PASSWORD :'pw' INHERIT;
         DROP DATABASE IF EXISTS ${BABELFISH_DB};
         CREATE DATABASE ${BABELFISH_DB} OWNER ${BABELFISH_USER};
 SQL
