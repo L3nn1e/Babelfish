@@ -130,6 +130,10 @@ RUN dnf update -y && \
     dnf clean all && \
     rm -rf /var/cache/dnf
 
+# Явная генерация локали поверх пакета glibc-langpack-en — защита на случай,
+# если RPM-триггер генерации локали почему-то не сработал в минимальном образе.
+RUN localedef -c -f UTF-8 -i en_US en_US.UTF-8 || true
+
 # Пользователь без прав root для запуска postgres
 # UID/GID 26 — исторически закреплены за postgres в Fedora/RHEL/AlmaLinux
 # (пакет postgresql-server), в отличие от Debian/Ubuntu, где принято 999/70.
@@ -151,7 +155,8 @@ ENV LANG=en_US.UTF-8
 ENV LC_ALL=en_US.UTF-8
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+COPY healthcheck.sh /usr/local/bin/healthcheck.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/healthcheck.sh
 
 VOLUME ["/var/storage/pgsql/data"]
 
@@ -159,9 +164,9 @@ EXPOSE 5432 1433
 
 # Встроенный healthcheck на уровне самого образа — работает даже если контейнер
 # запущен не через Quadlet (например, при разовом podman run в ходе отладки).
-# Использует переменные окружения, заданные при старте контейнера.
+# Логика вынесена в отдельный скрипт (раздел 4.1) — читаемее, чем длинный inline CMD.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD pg_isready -U "${BABELFISH_USER:-babelfish_user}" -d "${BABELFISH_DB:-babelfish_db}" || exit 1
+    CMD /usr/local/bin/healthcheck.sh
 
 USER postgres
 ENTRYPOINT ["entrypoint.sh"]
