@@ -57,7 +57,6 @@ RUN ./configure --prefix=/opt/postgres --with-libxml --with-uuid=e2fs --with-icu
     cp -v src/backend/utils/mb/Unicode/*.map /opt/postgres/include/server/src/backend/utils/mb/Unicode/ && \
     cd contrib && make -j"$(nproc)" && make install
 
-# Глобально добавляем pg_config в PATH и задаем переменную для всех последующих шагов
 ENV PATH="/opt/postgres/bin:${PATH}"
 ENV PG_CONFIG=/opt/postgres/bin/pg_config
 
@@ -95,7 +94,7 @@ RUN cp -r /build/babelfish_extensions/contrib/babelfishpg_money . && \
     cp -r /build/babelfish_extensions/contrib/babelfishpg_tds . && \
     cp -r /build/babelfish_extensions/contrib/babelfishpg_tsql .
 
-# 10. СБОРКА РАСШИРЕНИЙ BABELEFISH (КРИТИЧНО: явная передача PG_CONFIG в make)
+# 10. СБОРКА РАСШИРЕНИЙ BABELEFISH
 WORKDIR /build/postgresql_modified_for_babelfish/contrib/babelfishpg_money
 RUN make PG_CONFIG=/opt/postgres/bin/pg_config && make PG_CONFIG=/opt/postgres/bin/pg_config install
 
@@ -119,15 +118,17 @@ RUN PG_CPPFLAGS='-I/usr/include -I/usr/local/include -I/usr/local/include/antlr4
 ########################################
 FROM almalinux:9 AS runtime
 
+# ИСПРАВЛЕНО: добавлен glibc-common для корректной работы localedef
 RUN dnf install -y epel-release && \
     dnf config-manager --set-enabled crb && \
     dnf install -y \
         libicu libxml2 openssl libuuid krb5-libs \
         geos proj gdal json-c protobuf-c sqlite-libs \
-        freetds glibc-langpack-en shadow-utils && \
+        freetds glibc-langpack-en glibc-common shadow-utils && \
     dnf clean all && rm -rf /var/cache/dnf
 
-RUN localedef -c -f UTF-8 -i en_US en_US.UTF-8
+# ИСПРАВЛЕНО: стандартный порядок аргументов для RHEL/AlmaLinux
+RUN localedef -c -i en_US -f UTF-8 en_US.UTF-8
 
 RUN groupadd -r postgres --gid=26 && \
     useradd -r -g postgres --uid=26 --home-dir=/var/lib/pgsql --shell=/bin/bash postgres && \
