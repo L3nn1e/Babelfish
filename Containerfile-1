@@ -32,17 +32,15 @@ RUN dnf install -y epel-release && \
     dnf clean all && \
     rm -rf /var/cache/dnf
 
-# 2. Java 17 (критично для ANTLR 4.13+)
+# 2. Явное указание путей Java и CMake (ИСПРАВЛЕНО: объединено в одну строку для надежности)
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk
-ENV PATH="${JAVA_HOME}/bin:${PATH}"
+ENV PATH="/usr/local/bin:${JAVA_HOME}/bin:${PATH}"
 
 # 3. Установка cmake
 WORKDIR /opt
 RUN wget -q https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.sh && \
     sh cmake-${CMAKE_VERSION}-linux-x86_64.sh --skip-license --prefix=/usr/local && \
     rm cmake-${CMAKE_VERSION}-linux-x86_64.sh
-
-ENV PATH="/usr/local/bin:${PATH}"
 
 # 4. Клонирование репозиториев (РАЗНЫЕ теги!)
 WORKDIR /build
@@ -58,7 +56,6 @@ RUN ./configure --prefix=/opt/postgres \
         --with-gssapi --disable-werror && \
     make -j"$(nproc)" && \
     make install && \
-    # КРИТИЧНО: Копируем сгенерированные .map файлы для расширений Babelfish
     mkdir -p /opt/postgres/include/server/src/backend/utils/mb/Unicode && \
     cp -v src/backend/utils/mb/Unicode/*.map \
        /opt/postgres/include/server/src/backend/utils/mb/Unicode/ && \
@@ -88,19 +85,15 @@ RUN cp /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr/thirdparty/ant
         -DWITH_DEMO=False \
         -DBUILD_SHARED_LIBS=ON && \
     make -j"$(nproc)" && make install && \
-    # Копируем из lib ИЛИ lib64
     find /usr/local/lib /usr/local/lib64 -maxdepth 1 -name "libantlr4-runtime.so*" -exec cp {} /opt/postgres/lib/ \; && \
     ldconfig
 
-# Устанавливаем переменные для FindANTLR.cmake
-ENV ANTLR_JAR_LOCATION=/usr/local/lib/antlr-${ANTLR_VERSION}-complete.jar
-
-# 8. Генерация Makefile для ANTLR внутри babelfishpg_tsql
-# Это критичный шаг — Makefile babelfishpg_tsql вызывает cmake для antlr/, 
-# но без явного указания ANTLR_JAR_LOCATION cmake не находит jar и переменная остаётся пустой
+# 8. Генерация Makefile для ANTLR внутри babelfishpg_tsql (ИСПРАВЛЕНО: явный путь к Java)
 RUN cd /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr && \
     /usr/local/bin/cmake . \
         -DANTLR_JAR_LOCATION=/usr/local/lib/antlr-${ANTLR_VERSION}-complete.jar \
+        -DJava_JAVA_EXECUTABLE=/usr/lib/jvm/java-17-openjdk/bin/java \
+        -DCMAKE_PREFIX_PATH=/usr/local \
         -DCMAKE_INSTALL_PREFIX=/usr/local \
         -DBUILD_SHARED_LIBS=ON && \
     make -j"$(nproc)"
@@ -114,10 +107,10 @@ RUN cd babelfishpg_money && make -j"$(nproc)" && make install && cd .. && \
         cd .. && \
     cd babelfishpg_tds && make -j"$(nproc)" && make install && cd .. && \
     cd babelfishpg_tsql && \
-        PG_CPPFLAGS='-I/opt/postgres/include/server -I/usr/include -I/usr/local/include -DENABLE_SPATIAL_TYPES -DENABLE_TDS_LIB -I/usr/local/include/antlr4-runtime' \
+        PG_CPPFLAGS='-I/opt/postgres/include/server -I/usr/include -I/usr/local/include -I/usr/local/include/antlr4-runtime -DENABLE_SPATIAL_TYPES -DENABLE_TDS_LIB' \
         SHLIB_LINK='-lsybdb -L/usr/lib64 -L/usr/local/lib -lantlr4-runtime' \
             make -j"$(nproc)" && \
-        PG_CPPFLAGS='-I/opt/postgres/include/server -I/usr/include -I/usr/local/include -DENABLE_SPATIAL_TYPES -DENABLE_TDS_LIB -I/usr/local/include/antlr4-runtime' \
+        PG_CPPFLAGS='-I/opt/postgres/include/server -I/usr/include -I/usr/local/include -I/usr/local/include/antlr4-runtime -DENABLE_SPATIAL_TYPES -DENABLE_TDS_LIB' \
         SHLIB_LINK='-lsybdb -L/usr/lib64 -L/usr/local/lib -lantlr4-runtime' \
             make install
 
