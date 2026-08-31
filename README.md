@@ -78,9 +78,10 @@ PostGIS / Spatial datatypes и tds_fdw (linked servers) включены по у
 FROM almalinux:9 AS builder
 
 ARG PG_BABEL_TAG=BABEL_5_4_0__PG_17_7
-# EXT_BABEL_TAG — уточните точным тегом из git ls-remote (см. примечание ниже),
-# т.к. репозитории postgresql_modified_for_babelfish и babelfish_extensions
-# используют РАЗНЫЕ схемы версионирования тегов, а не общий BABEL_TAG.
+# EXT_BABEL_TAG подтверждён через git ls-remote (тег BABEL_5_4_0 существует в
+# babelfish_extensions) — но при смене версии Babelfish снова проверяйте оба
+# тега отдельно, т.к. postgresql_modified_for_babelfish и babelfish_extensions
+# используют РАЗНЫЕ схемы версионирования и не обязаны совпадать.
 ARG EXT_BABEL_TAG=BABEL_5_4_0
 ARG ANTLR_VERSION=4.13.2
 ARG CMAKE_VERSION=3.28.3
@@ -396,7 +397,7 @@ sudo podman build -t localhost/babelfish:5.4.0-pg17.7 \
     -f Containerfile .
 ```
 
-`EXT_BABEL_TAG` — проверьте перед сборкой командой `git ls-remote --tags` (раздел 3) и передайте актуальное значение, если оно отличается от дефолтного.
+`EXT_BABEL_TAG` для версии 5.4.0 уже подтверждён (`BABEL_5_4_0`) и стоит по умолчанию — команду `git ls-remote --tags` (раздел 3) достаточно повторить только при переходе на другую версию Babelfish.
 
 Сборка компилирует PostgreSQL + 4 расширения — рассчитывайте на 15–40 минут в зависимости от мощности сервера. Логи компиляции идут в стандартный вывод — если что-то падает, ошибка будет видна прямо в терминале.
 
@@ -680,11 +681,10 @@ sudo podman healthcheck run babelfish
 
 Ниже — то, что требует вашей проверки/решения перед первым `podman build`, а не автоматически исправлено в этом гайде:
 
-1. **Разные git-теги для двух репозиториев — подтверждено на практике, требует ручной проверки перед сборкой.** `postgresql_modified_for_babelfish` и `babelfish_extensions` — независимые репозитории с разными схемами версионирования, единый `BABEL_TAG` для обоих `git clone` работает не всегда (конкретно для 5.4.0 тег `BABEL_5_4_0__PG_17_7` существует только в первом репозитории). Перед сборкой уточните точное имя тега для `babelfish_extensions`:
+1. ~~Разные git-теги для двух репозиториев~~ — **закрыто для версии 5.4.0.** Подтверждено командой `git ls-remote`: `postgresql_modified_for_babelfish` использует `BABEL_5_4_0__PG_17_7`, `babelfish_extensions` — `BABEL_5_4_0` (именно так уже стоит в `Containerfile`, раздел 3). При переходе на другую версию Babelfish повторите проверку — это два независимых репозитория с разными схемами версионирования, совпадение тегов не гарантировано:
    ```bash
-   git ls-remote --tags https://github.com/babelfish-for-postgresql/babelfish_extensions.git | grep -i "5_4_0\|5\.4\.0"
+   git ls-remote --tags https://github.com/babelfish-for-postgresql/babelfish_extensions.git | grep -i "<версия>"
    ```
-   и используйте раздельные `ARG` (например, `PG_BABEL_TAG`/`EXT_BABEL_TAG`) для двух `git clone` в `Containerfile`, если версии тегов различаются.
 2. **Включение PostGIS/tds_fdw в БД по умолчанию.** Сейчас `entrypoint.sh` делает `CREATE EXTENSION` автоматически (управляется `ENABLE_POSTGIS`/`ENABLE_TDS_FDW`). Если хотите включать вручную под конкретную задачу — поменяйте дефолт на `false` или уберите блоки из `entrypoint.sh`.
 3. ~~`babelfishpg_tsql.database_name`~~ — **закрыто.** Официальный `INSTALLING.md.tmpl` проекта (ветка `BABEL_5_X_DEV`) подтверждает: оба GUC — `babelfishpg_tsql.database_name` и `babelfishpg_tsql.migration_mode` — задаются через `ALTER SYSTEM` (глобально), а не через `ALTER DATABASE ... SET`. Гайд уже обновлён под эту схему в разделе 4.
 
