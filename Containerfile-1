@@ -5,35 +5,36 @@
 ########################################
 FROM almalinux:9 AS builder
 
-# ИСПРАВЛЕНИЕ 1: Разные теги для разных репозиториев!
 ARG PG_BABEL_TAG=BABEL_5_4_0__PG_17_7
 ARG EXT_BABEL_TAG=BABEL_5_4_0
 ARG CMAKE_VERSION=3.28.3
 ARG POSTGIS_VERSION=3.5.1
 ARG TDS_FDW_VERSION=2.0.4
 
-# Установка зависимостей
-RUN dnf install -y \
-    gcc gcc-c++ make flex bison \
-    libicu-devel libxml2-devel openssl-devel \
-    libuuid-devel readline-devel zlib-devel \
-    python3-devel perl-devel \
-    wget unzip git pkgconf-pkg-config krb5-devel \
-    geos-devel proj-devel gdal-devel \
-    json-c-devel protobuf-c-devel sqlite-devel \
-    freetds-devel \
-    java-17-openjdk java-17-openjdk-devel && \
+# 1. Установка зависимостей с правильным подключением репозиториев
+RUN dnf install -y epel-release && \
+    dnf config-manager --set-enabled crb && \
+    dnf install -y \
+        gcc gcc-c++ make flex bison \
+        libicu-devel libxml2-devel openssl-devel \
+        libuuid-devel readline-devel zlib-devel \
+        python3-devel perl-devel \
+        wget unzip git pkgconf-pkg-config krb5-devel \
+        geos-devel proj-devel gdal-devel \
+        json-c-devel protobuf-c-devel sqlite-devel \
+        freetds-devel \
+        java-17-openjdk java-17-openjdk-devel && \
     dnf clean all && \
     rm -rf /var/cache/dnf
 
-# ИСПРАВЛЕНИЕ 2: Явное указание Java 17 как версии по умолчанию для CMake
+# 2. Явное указание Java 17 (критично для ANTLR 4.13+)
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
-# Проверка версии Java (для уверенности в логах сборки)
+# Проверка версии Java в логах сборки
 RUN java -version
 
-# Установка cmake
+# 3. Установка cmake
 WORKDIR /opt
 RUN wget -q https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.sh && \
     sh cmake-${CMAKE_VERSION}-linux-x86_64.sh --skip-license --prefix=/usr/local && \
@@ -41,14 +42,14 @@ RUN wget -q https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}
 
 ENV PATH="/usr/local/bin:${PATH}"
 
-# Клонирование репозиториев (с РАЗНЫМИ тегами)
+# 4. Клонирование репозиториев (с РАЗНЫМИ тегами!)
 WORKDIR /build
 RUN git clone --depth 1 --branch ${PG_BABEL_TAG} \
         https://github.com/babelfish-for-postgresql/postgresql_modified_for_babelfish.git && \
     git clone --depth 1 --branch ${EXT_BABEL_TAG} \
         https://github.com/babelfish-for-postgresql/babelfish_extensions.git
 
-# Сборка PostgreSQL (без опасных флагов --without-readline/zlib)
+# 5. Сборка PostgreSQL
 WORKDIR /build/postgresql_modified_for_babelfish
 RUN ./configure --prefix=/opt/postgres \
         --with-libxml --with-uuid=e2fs --with-icu --with-openssl \
@@ -59,7 +60,7 @@ RUN ./configure --prefix=/opt/postgres \
 
 ENV PG_CONFIG=/opt/postgres/bin/pg_config
 
-# Сборка PostGIS
+# 6. Сборка PostGIS
 WORKDIR /build
 RUN wget -q https://download.osgeo.org/postgis/source/postgis-${POSTGIS_VERSION}.tar.gz && \
     tar -xzf postgis-${POSTGIS_VERSION}.tar.gz && \
@@ -68,7 +69,7 @@ RUN wget -q https://download.osgeo.org/postgis/source/postgis-${POSTGIS_VERSION}
     make -j"$(nproc)" && make install && \
     cd .. && rm -rf postgis-${POSTGIS_VERSION} postgis-${POSTGIS_VERSION}.tar.gz
 
-# Сборка расширений Babelfish
+# 7. Сборка расширений Babelfish
 WORKDIR /build/babelfish_extensions/contrib
 RUN cd babelfishpg_money && make -j"$(nproc)" && make install && cd .. && \
     cd babelfishpg_common && \
@@ -89,11 +90,13 @@ RUN cd babelfishpg_money && make -j"$(nproc)" && make install && cd .. && \
 ########################################
 FROM almalinux:9 AS runtime
 
-# Установка зависимостей для runtime
-RUN dnf install -y \
-    libicu libxml2 openssl libuuid krb5-libs \
-    geos proj gdal json-c protobuf-c sqlite-libs \
-    freetds glibc-langpack-en shadow-utils && \
+# Установка runtime-зависимостей (также с EPEL/CRB для библиотек)
+RUN dnf install -y epel-release && \
+    dnf config-manager --set-enabled crb && \
+    dnf install -y \
+        libicu libxml2 openssl libuuid krb5-libs \
+        geos proj gdal json-c protobuf-c sqlite-libs \
+        freetds glibc-langpack-en shadow-utils && \
     dnf clean all && \
     rm -rf /var/cache/dnf
 
