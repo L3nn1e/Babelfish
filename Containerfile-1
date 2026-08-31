@@ -7,6 +7,7 @@ FROM almalinux:9 AS builder
 
 ARG PG_BABEL_TAG=BABEL_5_4_0__PG_17_7
 ARG EXT_BABEL_TAG=BABEL_5_4_0
+ARG ANTLR_VERSION=4.13.2
 ARG CMAKE_VERSION=3.28.3
 ARG POSTGIS_VERSION=3.5.1
 ARG TDS_FDW_VERSION=2.0.4
@@ -50,7 +51,7 @@ RUN git clone --depth 1 --branch ${PG_BABEL_TAG} \
     git clone --depth 1 --branch ${EXT_BABEL_TAG} \
         https://github.com/babelfish-for-postgresql/babelfish_extensions.git
 
-# 5. Сборка PostgreSQL + КОПИРОВАНИЕ .map файлов
+# 5. Сборка PostgreSQL + копирование .map файлов
 WORKDIR /build/postgresql_modified_for_babelfish
 RUN ./configure --prefix=/opt/postgres \
         --with-libxml --with-uuid=e2fs --with-icu --with-openssl \
@@ -58,7 +59,6 @@ RUN ./configure --prefix=/opt/postgres \
     make -j"$(nproc)" && \
     make install && \
     # КРИТИЧНО: Копируем сгенерированные .map файлы для расширений Babelfish
-    # Без этих файлов babelfishpg_common не скомпилирует модули кодировок
     mkdir -p /opt/postgres/include/server/src/backend/utils/mb/Unicode && \
     cp -v src/backend/utils/mb/Unicode/*.map \
        /opt/postgres/include/server/src/backend/utils/mb/Unicode/ && \
@@ -75,7 +75,21 @@ RUN wget -q https://download.osgeo.org/postgis/source/postgis-${POSTGIS_VERSION}
     make -j"$(nproc)" && make install && \
     cd .. && rm -rf postgis-${POSTGIS_VERSION} postgis-${POSTGIS_VERSION}.tar.gz
 
-# 7. Сборка расширений Babelfish (с правильным include path)
+# 7. СБОРКА ANTLR C++ RUNTIME (КРИТИЧНО для babelfishpg_tsql!)
+WORKDIR /build
+RUN cp /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr/thirdparty/antlr/antlr-${ANTLR_VERSION}-complete.jar \
+        /usr/local/lib/ && \
+    wget -q http://www.antlr.org/download/antlr4-cpp-runtime-${ANTLR_VERSION}-source.zip && \
+    unzip -q -d antlr4 antlr4-cpp-runtime-${ANTLR_VERSION}-source.zip && \
+    cd antlr4 && mkdir build && cd build && \
+    /usr/local/bin/cmake .. \
+        -DANTLR_JAR_LOCATION=/usr/local/lib/antlr-${ANTLR_VERSION}-complete.jar \
+        -DCMAKE_INSTALL_PREFIX=/usr/local -DWITH_DEMO=False && \
+    make -j"$(nproc)" && make install && \
+    cp /usr/local/lib/libantlr4-runtime.so.${ANTLR_VERSION} /opt/postgres/lib/ && \
+    ldconfig
+
+# 8. Сборка расширений Babelfish
 WORKDIR /build/babelfish_extensions/contrib
 RUN cd babelfishpg_money && make -j"$(nproc)" && make install && cd .. && \
     cd babelfishpg_common && \
