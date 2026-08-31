@@ -72,18 +72,18 @@ RUN wget -q https://download.osgeo.org/postgis/source/postgis-${POSTGIS_VERSION}
     make -j"$(nproc)" && make install && \
     cd .. && rm -rf postgis-${POSTGIS_VERSION} postgis-${POSTGIS_VERSION}.tar.gz
 
-# 7. Сборка расширений Babelfish
+# 7. Сборка расширений Babelfish (БЕЗ параллелизма для диагностики)
 WORKDIR /build/babelfish_extensions/contrib
-RUN cd babelfishpg_money && make -j"$(nproc)" && make install && cd .. && \
+RUN cd babelfishpg_money && make && make install && cd .. && \
     cd babelfishpg_common && \
-        PG_CPPFLAGS='-I/usr/include -DENABLE_SPATIAL_TYPES' make -j"$(nproc)" && \
+        PG_CPPFLAGS='-I/usr/include -DENABLE_SPATIAL_TYPES' make && \
         PG_CPPFLAGS='-I/usr/include -DENABLE_SPATIAL_TYPES' make install && \
         cd .. && \
-    cd babelfishpg_tds && make -j"$(nproc)" && make install && cd .. && \
+    cd babelfishpg_tds && make && make install && cd .. && \
     cd babelfishpg_tsql && \
         PG_CPPFLAGS='-I/usr/include -DENABLE_SPATIAL_TYPES -DENABLE_TDS_LIB' \
         SHLIB_LINK='-lsybdb -L/usr/lib64' \
-            make -j"$(nproc)" && \
+            make && \
         PG_CPPFLAGS='-I/usr/include -DENABLE_SPATIAL_TYPES -DENABLE_TDS_LIB' \
         SHLIB_LINK='-lsybdb -L/usr/lib64' \
             make install
