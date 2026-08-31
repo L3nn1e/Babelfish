@@ -18,7 +18,7 @@ RUN dnf install -y epel-release && \
         gcc gcc-c++ make flex bison \
         libicu-devel libxml2-devel openssl-devel \
         libuuid-devel readline-devel zlib-devel \
-        python3-devel perl-devel \
+        python3-devel perl-devel perl-IPC-Run \
         wget unzip git pkgconf-pkg-config krb5-devel \
         geos-devel proj-devel gdal-devel \
         json-c-devel protobuf-c-devel sqlite-devel \
