@@ -80,12 +80,7 @@ RUN cp /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr/thirdparty/ant
     find /usr/local/lib /usr/local/lib64 -maxdepth 1 -name "libantlr4-runtime.so*" -exec cp {} /opt/postgres/lib/ \; && \
     ldconfig
 
-# 8. Генерация Makefile для ANTLR внутри babelfishpg_tsql
-RUN cd /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr && \
-    /usr/local/bin/cmake . -DANTLR_JAR_LOCATION=/usr/local/lib/antlr-${ANTLR_VERSION}-complete.jar -DJava_JAVA_EXECUTABLE=/usr/lib/jvm/java-17-openjdk/bin/java -DCMAKE_PREFIX_PATH=/usr/local -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=ON && \
-    make -j"$(nproc)"
-
-# 9. ПОДГОТОВКА К СБОРКЕ: Создаём симлинк /src и копируем расширения
+# 8. ПОДГОТОВКА К СБОРКЕ: Создаём симлинк /src и копируем расширения
 RUN ln -sfn /build/postgresql_modified_for_babelfish/src /src
 
 WORKDIR /build/postgresql_modified_for_babelfish/contrib
@@ -93,6 +88,12 @@ RUN cp -r /build/babelfish_extensions/contrib/babelfishpg_money . && \
     cp -r /build/babelfish_extensions/contrib/babelfishpg_common . && \
     cp -r /build/babelfish_extensions/contrib/babelfishpg_tds . && \
     cp -r /build/babelfish_extensions/contrib/babelfishpg_tsql .
+
+# 9. ГЕНЕРАЦИЯ MAKEFILE ДЛЯ ANTLR В IN-TREE ДИРЕКТОРИИ (КРИТИЧНО!)
+# После копирования расширений нужно сгенерировать Makefile для ANTLR в новой директории
+RUN cd /build/postgresql_modified_for_babelfish/contrib/babelfishpg_tsql/antlr && \
+    /usr/local/bin/cmake . -DANTLR_JAR_LOCATION=/usr/local/lib/antlr-${ANTLR_VERSION}-complete.jar -DJava_JAVA_EXECUTABLE=/usr/lib/jvm/java-17-openjdk/bin/java -DCMAKE_PREFIX_PATH=/usr/local -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=ON && \
+    make -j"$(nproc)"
 
 # 10. СБОРКА РАСШИРЕНИЙ BABELEFISH
 WORKDIR /build/postgresql_modified_for_babelfish/contrib/babelfishpg_money
@@ -118,8 +119,6 @@ RUN PG_CPPFLAGS='-I/usr/include -I/usr/local/include -I/usr/local/include/antlr4
 ########################################
 FROM almalinux:9 AS runtime
 
-# ИСПРАВЛЕНО: glibc-langpack-en уже содержит готовую локаль en_US.UTF-8
-# Команда localedef НЕ НУЖНА — она только ломает сборку в минимальном образе
 RUN dnf install -y epel-release && \
     dnf config-manager --set-enabled crb && \
     dnf install -y \
@@ -127,9 +126,6 @@ RUN dnf install -y epel-release && \
         geos proj gdal json-c protobuf-c sqlite-libs \
         freetds glibc-langpack-en shadow-utils && \
     dnf clean all && rm -rf /var/cache/dnf
-
-# УДАЛЕНО: RUN localedef -c -i en_US -f UTF-8 en_US.UTF-8
-# (пакет glibc-langpack-en уже устанавливает готовую локаль в /usr/lib/locale/)
 
 RUN groupadd -r postgres --gid=26 && \
     useradd -r -g postgres --uid=26 --home-dir=/var/lib/pgsql --shell=/bin/bash postgres && \
