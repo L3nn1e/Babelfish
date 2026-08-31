@@ -5,6 +5,7 @@
 ########################################
 FROM almalinux:9 AS builder
 
+# 1. РАЗНЫЕ теги для разных репозиториев (КРИТИЧНО для избежания 404)
 ARG PG_BABEL_TAG=BABEL_5_4_0__PG_17_7
 ARG EXT_BABEL_TAG=BABEL_5_4_0
 ARG ANTLR_VERSION=4.13.2
@@ -12,7 +13,7 @@ ARG CMAKE_VERSION=3.28.3
 ARG POSTGIS_VERSION=3.5.1
 ARG TDS_FDW_VERSION=2.0.4
 
-# 1. Установка зависимостей
+# 2. Установка зависимостей
 RUN dnf install -y epel-release && \
     dnf config-manager --set-enabled crb && \
     dnf install -y \
@@ -32,36 +33,33 @@ RUN dnf install -y epel-release && \
     dnf clean all && \
     rm -rf /var/cache/dnf
 
-# 2. Явное указание путей Java и CMake
+# 3. Явное указание путей Java и CMake
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk
 ENV PATH="/usr/local/bin:${JAVA_HOME}/bin:${PATH}"
 
-# 3. Установка cmake
+# 4. Установка cmake
 WORKDIR /opt
 RUN wget -q https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.sh && \
     sh cmake-${CMAKE_VERSION}-linux-x86_64.sh --skip-license --prefix=/usr/local && \
     rm cmake-${CMAKE_VERSION}-linux-x86_64.sh
 
-# 4. Клонирование репозиториев (РАЗНЫЕ теги!)
+# 5. Клонирование репозиториев (с РАЗНЫМИ тегами!)
 WORKDIR /build
 RUN git clone --depth 1 --branch ${PG_BABEL_TAG} \
         https://github.com/babelfish-for-postgresql/postgresql_modified_for_babelfish.git && \
     git clone --depth 1 --branch ${EXT_BABEL_TAG} \
         https://github.com/babelfish-for-postgresql/babelfish_extensions.git
 
-# 5. Сборка PostgreSQL + копирование заголовков с правильной структурой
+# 6. Сборка PostgreSQL + хирургическое копирование заголовков для Babelfish
 WORKDIR /build/postgresql_modified_for_babelfish
 RUN ./configure --prefix=/opt/postgres \
         --with-libxml --with-uuid=e2fs --with-icu --with-openssl \
         --with-gssapi --disable-werror && \
     make -j"$(nproc)" && \
     make install && \
-    # Копируем ВСЕ заголовки из исходников
-    cp -rv src/include/* /opt/postgres/include/server/ && \
-    # КРИТИЧНО: Создаём симлинк для путей типа src/include/lib/qunique.h
-    # Babelfish использует полные пути src/include/..., поэтому нужен симлинк
-    mkdir -p /opt/postgres/include/server/src && \
-    ln -s .. /opt/postgres/include/server/src/include && \
+    # Создаем нужную структуру для жестких путей в коде Babelfish, не ломая сгенерированные заголовки PostGIS
+    mkdir -p /opt/postgres/include/server/src/include/lib && \
+    cp src/include/lib/qunique.h /opt/postgres/include/server/src/include/lib/ && \
     # Копируем .map файлы для модулей кодировок
     mkdir -p /opt/postgres/include/server/src/backend/utils/mb/Unicode && \
     cp -v src/backend/utils/mb/Unicode/*.map \
@@ -70,7 +68,7 @@ RUN ./configure --prefix=/opt/postgres \
 
 ENV PG_CONFIG=/opt/postgres/bin/pg_config
 
-# 6. Сборка PostGIS
+# 7. Сборка PostGIS
 WORKDIR /build
 RUN wget -q https://download.osgeo.org/postgis/source/postgis-${POSTGIS_VERSION}.tar.gz && \
     tar -xzf postgis-${POSTGIS_VERSION}.tar.gz && \
@@ -79,13 +77,14 @@ RUN wget -q https://download.osgeo.org/postgis/source/postgis-${POSTGIS_VERSION}
     make -j"$(nproc)" && make install && \
     cd .. && rm -rf postgis-${POSTGIS_VERSION} postgis-${POSTGIS_VERSION}.tar.gz
 
-# 7. СБОРКА ANTLR C++ RUNTIME
+# 8. СБОРКА ANTLR C++ RUNTIME (через GitHub для 100% защиты от 404)
 WORKDIR /build
 RUN cp /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr/thirdparty/antlr/antlr-${ANTLR_VERSION}-complete.jar \
         /usr/local/lib/ && \
-    wget -q http://www.antlr.org/download/antlr4-cpp-runtime-${ANTLR_VERSION}-source.zip && \
-    unzip -q -d antlr4 antlr4-cpp-runtime-${ANTLR_VERSION}-source.zip && \
-    cd antlr4 && mkdir build && cd build && \
+    # Скачиваем с GitHub Releases вместо antlr.org (гарантированно работает)
+    wget -q https://github.com/antlr/antlr4/archive/refs/tags/${ANTLR_VERSION}.zip -O antlr4-source.zip && \
+    unzip -q -d antlr4 antlr4-source.zip && \
+    cd antlr4/antlr4-${ANTLR_VERSION}/runtime/Cpp && mkdir build && cd build && \
     /usr/local/bin/cmake .. \
         -DANTLR_JAR_LOCATION=/usr/local/lib/antlr-${ANTLR_VERSION}-complete.jar \
         -DCMAKE_INSTALL_PREFIX=/usr/local \
@@ -95,7 +94,7 @@ RUN cp /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr/thirdparty/ant
     find /usr/local/lib /usr/local/lib64 -maxdepth 1 -name "libantlr4-runtime.so*" -exec cp {} /opt/postgres/lib/ \; && \
     ldconfig
 
-# 8. Генерация Makefile для ANTLR внутри babelfishpg_tsql
+# 9. Генерация Makefile для ANTLR внутри babelfishpg_tsql
 RUN cd /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr && \
     /usr/local/bin/cmake . \
         -DANTLR_JAR_LOCATION=/usr/local/lib/antlr-${ANTLR_VERSION}-complete.jar \
@@ -105,7 +104,7 @@ RUN cd /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr && \
         -DBUILD_SHARED_LIBS=ON && \
     make -j"$(nproc)"
 
-# 9. Сборка расширений Babelfish
+# 10. Сборка расширений Babelfish
 WORKDIR /build/babelfish_extensions/contrib
 RUN cd babelfishpg_money && make -j"$(nproc)" && make install && cd .. && \
     cd babelfishpg_common && \
