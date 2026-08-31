@@ -177,7 +177,7 @@ RUN cp /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr/thirdparty/ant
     cd antlr4 && mkdir build && cd build && \
     /usr/local/bin/cmake .. \
         -DANTLR_JAR_LOCATION=/usr/local/lib/antlr-${ANTLR_VERSION}-complete.jar \
-        -DCMAKE_INSTALL_PREFIX=/usr/local -DWITH_DEMO=False && \
+        -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_INSTALL_LIBDIR=lib -DWITH_DEMO=False && \
     make -j"$(nproc)" && make install && \
     cp /usr/local/lib/libantlr4-runtime.so.${ANTLR_VERSION} /opt/postgres/lib/
 
