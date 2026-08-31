@@ -12,8 +12,25 @@ ARG CMAKE_VERSION=3.28.3
 ARG POSTGIS_VERSION=3.5.1
 ARG TDS_FDW_VERSION=2.0.4
 
-# 1. Установка зависимостей (с EPEL и CRB)
-RUN dnf install -y epel-release && dnf config-manager --set-enabled crb && dnf install -y gcc gcc-c++ make flex bison libicu-devel libxml2-devel openssl-devel libuuid-devel readline-devel zlib-devel python3-devel perl perl-core perl-devel perl-IPC-Run perl-Test-Simple perl-Getopt-Long perl-File-Basename perl-File-Copy perl-File-Compare perl-Text-ParseWords wget unzip git pkgconf-pkg-config krb5-devel geos-devel proj-devel gdal-devel json-c-devel protobuf-c-devel sqlite-devel freetds-devel java-17-openjdk java-17-openjdk-devel libxslt-devel && dnf clean all && rm -rf /var/cache/dnf
+# 1. Установка зависимостей
+RUN dnf install -y epel-release && \
+    dnf config-manager --set-enabled crb && \
+    dnf install -y \
+        gcc gcc-c++ make flex bison \
+        libicu-devel libxml2-devel openssl-devel \
+        libuuid-devel readline-devel zlib-devel \
+        python3-devel \
+        perl perl-core perl-devel perl-IPC-Run perl-Test-Simple \
+        perl-Getopt-Long perl-File-Basename perl-File-Copy \
+        perl-File-Compare perl-Text-ParseWords \
+        wget unzip git pkgconf-pkg-config krb5-devel \
+        geos-devel proj-devel gdal-devel \
+        json-c-devel protobuf-c-devel sqlite-devel \
+        freetds-devel \
+        java-17-openjdk java-17-openjdk-devel \
+        libxslt-devel && \
+    dnf clean all && \
+    rm -rf /var/cache/dnf
 
 # 2. Java 17 для ANTLR
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk
@@ -21,43 +38,54 @@ ENV PATH="/usr/local/bin:${JAVA_HOME}/bin:${PATH}"
 
 # 3. Установка cmake
 WORKDIR /opt
-RUN wget -q https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.sh && sh cmake-${CMAKE_VERSION}-linux-x86_64.sh --skip-license --prefix=/usr/local && rm cmake-${CMAKE_VERSION}-linux-x86_64.sh
+RUN wget -q https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.sh && \
+    sh cmake-${CMAKE_VERSION}-linux-x86_64.sh --skip-license --prefix=/usr/local && \
+    rm cmake-${CMAKE_VERSION}-linux-x86_64.sh
 
-# 4. Клонирование репозиториев (компактная версия, защита от обрезки)
+# 4. Клонирование репозиториев (РАЗНЫЕ теги!)
 WORKDIR /build
-RUN git clone --depth 1 --branch ${PG_BABEL_TAG} https://github.com/babelfish-for-postgresql/postgresql_modified_for_babelfish.git && git clone --depth 1 --branch ${EXT_BABEL_TAG} https://github.com/babelfish-for-postgresql/babelfish_extensions.git
+RUN git clone --depth 1 --branch ${PG_BABEL_TAG} https://github.com/babelfish-for-postgresql/postgresql_modified_for_babelfish.git && \
+    git clone --depth 1 --branch ${EXT_BABEL_TAG} https://github.com/babelfish-for-postgresql/babelfish_extensions.git
 
-
-# 5. Сборка PostgreSQL + копирование заголовков И скриптов генерации
+# 5. Сборка PostgreSQL + хирургическое копирование заголовков
 WORKDIR /build/postgresql_modified_for_babelfish
 RUN ./configure --prefix=/opt/postgres --with-libxml --with-uuid=e2fs --with-icu --with-openssl --with-gssapi --disable-werror && \
     make -j"$(nproc)" && make install && \
-    # Хирургическое копирование заголовков для Babelfish
     mkdir -p /opt/postgres/include/server/src/include/lib && \
     cp src/include/lib/qunique.h /opt/postgres/include/server/src/include/lib/ && \
     mkdir -p /opt/postgres/include/server/src/backend/utils/mb/Unicode && \
     cp -v src/backend/utils/mb/Unicode/*.map /opt/postgres/include/server/src/backend/utils/mb/Unicode/ && \
-    # КРИТИЧНО: Копируем src/tools/ для скриптов генерации (gen_keywordlist.pl и др.)
-    # Расширения Babelfish ищут их через top_srcdir, который указывает на /opt/postgres
-    cp -r src/tools /opt/postgres/src/ && \
     cd contrib && make -j"$(nproc)" && make install
 
-
-# 6. Сборка PostGIS
+# 6. Сборка PostGIS (ИСПРАВЛЕНО: явный PATH и абсолютный путь к pg_config)
 WORKDIR /build
-RUN wget -q https://download.osgeo.org/postgis/source/postgis-${POSTGIS_VERSION}.tar.gz && tar -xzf postgis-${POSTGIS_VERSION}.tar.gz && cd postgis-${POSTGIS_VERSION} && ./configure --with-pgconfig=${PG_CONFIG} && make -j"$(nproc)" && make install && cd .. && rm -rf postgis-${POSTGIS_VERSION} postgis-${POSTGIS_VERSION}.tar.gz
+RUN export PATH=/opt/postgres/bin:$PATH && \
+    wget -q https://download.osgeo.org/postgis/source/postgis-${POSTGIS_VERSION}.tar.gz && \
+    tar -xzf postgis-${POSTGIS_VERSION}.tar.gz && \
+    cd postgis-${POSTGIS_VERSION} && \
+    ./configure --with-pgconfig=/opt/postgres/bin/pg_config && \
+    make -j"$(nproc)" && make install && \
+    cd .. && rm -rf postgis-${POSTGIS_VERSION} postgis-${POSTGIS_VERSION}.tar.gz
 
 # 7. СБОРКА ANTLR C++ RUNTIME (через GitHub для защиты от 404)
 WORKDIR /build
-RUN cp /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr/thirdparty/antlr/antlr-${ANTLR_VERSION}-complete.jar /usr/local/lib/ && wget -q https://github.com/antlr/antlr4/archive/refs/tags/${ANTLR_VERSION}.zip -O antlr4-source.zip && unzip -q -d antlr4 antlr4-source.zip && cd antlr4/antlr4-${ANTLR_VERSION}/runtime/Cpp && mkdir build && cd build && /usr/local/bin/cmake .. -DANTLR_JAR_LOCATION=/usr/local/lib/antlr-${ANTLR_VERSION}-complete.jar -DCMAKE_INSTALL_PREFIX=/usr/local -DWITH_DEMO=False -DBUILD_SHARED_LIBS=ON && make -j"$(nproc)" && make install && find /usr/local/lib /usr/local/lib64 -maxdepth 1 -name "libantlr4-runtime.so*" -exec cp {} /opt/postgres/lib/ \; && ldconfig
+RUN cp /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr/thirdparty/antlr/antlr-${ANTLR_VERSION}-complete.jar /usr/local/lib/ && \
+    wget -q https://github.com/antlr/antlr4/archive/refs/tags/${ANTLR_VERSION}.zip -O antlr4-source.zip && \
+    unzip -q -d antlr4 antlr4-source.zip && \
+    cd antlr4/antlr4-${ANTLR_VERSION}/runtime/Cpp && mkdir build && cd build && \
+    /usr/local/bin/cmake .. -DANTLR_JAR_LOCATION=/usr/local/lib/antlr-${ANTLR_VERSION}-complete.jar -DCMAKE_INSTALL_PREFIX=/usr/local -DWITH_DEMO=False -DBUILD_SHARED_LIBS=ON && \
+    make -j"$(nproc)" && make install && \
+    find /usr/local/lib /usr/local/lib64 -maxdepth 1 -name "libantlr4-runtime.so*" -exec cp {} /opt/postgres/lib/ \; && \
+    ldconfig
 
-# 8. Генерация Makefile для ANTLR внутри babelfishpg_tsql (с явным путем к Java)
-RUN cd /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr && /usr/local/bin/cmake . -DANTLR_JAR_LOCATION=/usr/local/lib/antlr-${ANTLR_VERSION}-complete.jar -DJava_JAVA_EXECUTABLE=/usr/lib/jvm/java-17-openjdk/bin/java -DCMAKE_PREFIX_PATH=/usr/local -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=ON && make -j"$(nproc)"
+# 8. Генерация Makefile для ANTLR внутри babelfishpg_tsql
+RUN cd /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr && \
+    /usr/local/bin/cmake . -DANTLR_JAR_LOCATION=/usr/local/lib/antlr-${ANTLR_VERSION}-complete.jar -DJava_JAVA_EXECUTABLE=/usr/lib/jvm/java-17-openjdk/bin/java -DCMAKE_PREFIX_PATH=/usr/local -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=ON && \
+    make -j"$(nproc)"
 
 # 9. ПОДГОТОВКА К СБОРКЕ: Создаём симлинк /src и копируем расширения
 # КРИТИЧНО: Makefile расширения ищет скрипт по абсолютному пути /src/tools/...
-# из-за того, что top_srcdir в pgxs пустой. Симлинк направит его в исходники PG.
-RUN ln -sfn /build/postgresql_modified_for_babelfish /src
+RUN ln -sfn /build/postgresql_modified_for_babelfish/src /src
 
 WORKDIR /build/postgresql_modified_for_babelfish/contrib
 RUN cp -r /build/babelfish_extensions/contrib/babelfishpg_money . && \
@@ -65,34 +93,43 @@ RUN cp -r /build/babelfish_extensions/contrib/babelfishpg_money . && \
     cp -r /build/babelfish_extensions/contrib/babelfishpg_tds . && \
     cp -r /build/babelfish_extensions/contrib/babelfishpg_tsql .
 
-# 10. СБОРКА РАСШИРЕНИЙ BABELEFISH (как родных contrib-модулей)
+# 10. СБОРКА РАСШИРЕНИЙ BABELEFISH
 WORKDIR /build/postgresql_modified_for_babelfish/contrib/babelfishpg_money
 RUN make && make install
 
 WORKDIR /build/postgresql_modified_for_babelfish/contrib/babelfishpg_common
-RUN PG_CPPFLAGS='-I/usr/include -DENABLE_SPATIAL_TYPES' make && PG_CPPFLAGS='-I/usr/include -DENABLE_SPATIAL_TYPES' make install
+RUN PG_CPPFLAGS='-I/usr/include -DENABLE_SPATIAL_TYPES' make && \
+    PG_CPPFLAGS='-I/usr/include -DENABLE_SPATIAL_TYPES' make install
 
 WORKDIR /build/postgresql_modified_for_babelfish/contrib/babelfishpg_tds
 RUN make && make install
 
 WORKDIR /build/postgresql_modified_for_babelfish/contrib/babelfishpg_tsql
-RUN PG_CPPFLAGS='-I/usr/include -I/usr/local/include -I/usr/local/include/antlr4-runtime -DENABLE_SPATIAL_TYPES -DENABLE_TDS_LIB' SHLIB_LINK='-lsybdb -L/usr/lib64 -L/usr/local/lib -lantlr4-runtime' make && PG_CPPFLAGS='-I/usr/include -I/usr/local/include -I/usr/local/include/antlr4-runtime -DENABLE_SPATIAL_TYPES -DENABLE_TDS_LIB' SHLIB_LINK='-lsybdb -L/usr/lib64 -L/usr/local/lib -lantlr4-runtime' make install
+RUN PG_CPPFLAGS='-I/usr/include -I/usr/local/include -I/usr/local/include/antlr4-runtime -DENABLE_SPATIAL_TYPES -DENABLE_TDS_LIB' \
+    SHLIB_LINK='-lsybdb -L/usr/lib64 -L/usr/local/lib -lantlr4-runtime' make && \
+    PG_CPPFLAGS='-I/usr/include -I/usr/local/include -I/usr/local/include/antlr4-runtime -DENABLE_SPATIAL_TYPES -DENABLE_TDS_LIB' \
+    SHLIB_LINK='-lsybdb -L/usr/lib64 -L/usr/local/lib -lantlr4-runtime' make install
 
 ########################################
 # Этап 2: runtime
 ########################################
 FROM almalinux:9 AS runtime
 
-# Runtime-зависимости (с EPEL и CRB)
-RUN dnf install -y epel-release && dnf config-manager --set-enabled crb && dnf install -y libicu libxml2 openssl libuuid krb5-libs geos proj gdal json-c protobuf-c sqlite-libs freetds glibc-langpack-en shadow-utils && dnf clean all && rm -rf /var/cache/dnf
+RUN dnf install -y epel-release && \
+    dnf config-manager --set-enabled crb && \
+    dnf install -y \
+        libicu libxml2 openssl libuuid krb5-libs \
+        geos proj gdal json-c protobuf-c sqlite-libs \
+        freetds glibc-langpack-en shadow-utils && \
+    dnf clean all && rm -rf /var/cache/dnf
 
-# Генерация локали
 RUN localedef -c -f UTF-8 -i en_US en_US.UTF-8
 
-# Создание пользователя postgres (UID/GID 26 — стандарт для EL)
-RUN groupadd -r postgres --gid=26 && useradd -r -g postgres --uid=26 --home-dir=/var/lib/pgsql --shell=/bin/bash postgres && mkdir -p /var/storage/pgsql/data && chown -R postgres:postgres /var/storage/pgsql
+RUN groupadd -r postgres --gid=26 && \
+    useradd -r -g postgres --uid=26 --home-dir=/var/lib/pgsql --shell=/bin/bash postgres && \
+    mkdir -p /var/storage/pgsql/data && \
+    chown -R postgres:postgres /var/storage/pgsql
 
-# Копирование собранного PostgreSQL из builder
 COPY --from=builder /opt/postgres /opt/postgres
 
 ENV PATH="/opt/postgres/bin:${PATH}"
@@ -100,7 +137,6 @@ ENV PGDATA=/var/storage/pgsql/data
 ENV LANG=en_US.UTF-8
 ENV LC_ALL=en_US.UTF-8
 
-# Копирование скриптов entrypoint и healthcheck
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY healthcheck.sh /usr/local/bin/healthcheck.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/healthcheck.sh
