@@ -75,7 +75,7 @@ RUN wget -q https://download.osgeo.org/postgis/source/postgis-${POSTGIS_VERSION}
     make -j"$(nproc)" && make install && \
     cd .. && rm -rf postgis-${POSTGIS_VERSION} postgis-${POSTGIS_VERSION}.tar.gz
 
-# 7. СБОРКА ANTLR C++ RUNTIME (КРИТИЧНО для babelfishpg_tsql!)
+# 7. СБОРКА ANTLR C++ RUNTIME (ИСПРАВЛЕНО: универсальный поиск и копирование)
 WORKDIR /build
 RUN cp /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr/thirdparty/antlr/antlr-${ANTLR_VERSION}-complete.jar \
         /usr/local/lib/ && \
@@ -84,9 +84,12 @@ RUN cp /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr/thirdparty/ant
     cd antlr4 && mkdir build && cd build && \
     /usr/local/bin/cmake .. \
         -DANTLR_JAR_LOCATION=/usr/local/lib/antlr-${ANTLR_VERSION}-complete.jar \
-        -DCMAKE_INSTALL_PREFIX=/usr/local -DWITH_DEMO=False && \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DWITH_DEMO=False \
+        -DBUILD_SHARED_LIBS=ON && \
     make -j"$(nproc)" && make install && \
-    cp /usr/local/lib/libantlr4-runtime.so.${ANTLR_VERSION} /opt/postgres/lib/ && \
+    # ИСПРАВЛЕНИЕ: Копируем из lib ИЛИ lib64, используя шаблон, чтобы не зависеть от точного имени файла
+    find /usr/local/lib /usr/local/lib64 -maxdepth 1 -name "libantlr4-runtime.so*" -exec cp {} /opt/postgres/lib/ \; && \
     ldconfig
 
 # 8. Сборка расширений Babelfish
