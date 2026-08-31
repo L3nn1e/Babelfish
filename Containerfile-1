@@ -105,26 +105,30 @@ RUN cd /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr && \
     make -j"$(nproc)"
 
 # 10. Сборка расширений Babelfish
-# КРИТИЧНО: передаем top_srcdir, чтобы make нашел скрипты генерации (gen_keywordlist.pl и др.)
+# КРИТИЧНО: параметр top_srcdir указывает make, где лежат скрипты генерации PostgreSQL
 WORKDIR /build/babelfish_extensions/contrib
-ENV PG_SRC=/build/postgresql_modified_for_babelfish
 
 RUN cd babelfishpg_money && \
-        make top_srcdir=${PG_SRC} && make top_srcdir=${PG_SRC} install && cd .. && \
+        make top_srcdir=/build/postgresql_modified_for_babelfish && \
+        make top_srcdir=/build/postgresql_modified_for_babelfish install && \
+        cd .. && \
     cd babelfishpg_common && \
         PG_CPPFLAGS='-I/opt/postgres/include/server -I/usr/include -DENABLE_SPATIAL_TYPES' \
-        make top_srcdir=${PG_SRC} && \
+        make top_srcdir=/build/postgresql_modified_for_babelfish && \
         PG_CPPFLAGS='-I/opt/postgres/include/server -I/usr/include -DENABLE_SPATIAL_TYPES' \
-        make top_srcdir=${PG_SRC} install && cd .. && \
+        make top_srcdir=/build/postgresql_modified_for_babelfish install && \
+        cd .. && \
     cd babelfishpg_tds && \
-        make top_srcdir=${PG_SRC} && make top_srcdir=${PG_SRC} install && cd .. && \
+        make top_srcdir=/build/postgresql_modified_for_babelfish && \
+        make top_srcdir=/build/postgresql_modified_for_babelfish install && \
+        cd .. && \
     cd babelfishpg_tsql && \
         PG_CPPFLAGS='-I/opt/postgres/include/server -I/usr/include -I/usr/local/include -I/usr/local/include/antlr4-runtime -DENABLE_SPATIAL_TYPES -DENABLE_TDS_LIB' \
         SHLIB_LINK='-lsybdb -L/usr/lib64 -L/usr/local/lib -lantlr4-runtime' \
-            make top_srcdir=${PG_SRC} && \
+            make top_srcdir=/build/postgresql_modified_for_babelfish && \
         PG_CPPFLAGS='-I/opt/postgres/include/server -I/usr/include -I/usr/local/include -I/usr/local/include/antlr4-runtime -DENABLE_SPATIAL_TYPES -DENABLE_TDS_LIB' \
         SHLIB_LINK='-lsybdb -L/usr/lib64 -L/usr/local/lib -lantlr4-runtime' \
-            make top_srcdir=${PG_SRC} install
+            make top_srcdir=/build/postgresql_modified_for_babelfish install
 
 ########################################
 # Этап 2: runtime
