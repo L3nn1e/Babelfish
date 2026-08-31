@@ -49,17 +49,20 @@ RUN git clone --depth 1 --branch ${PG_BABEL_TAG} \
     git clone --depth 1 --branch ${EXT_BABEL_TAG} \
         https://github.com/babelfish-for-postgresql/babelfish_extensions.git
 
-# 5. Сборка PostgreSQL + копирование ВСЕХ заголовков и .map файлов
+# 5. Сборка PostgreSQL + копирование заголовков с правильной структурой
 WORKDIR /build/postgresql_modified_for_babelfish
 RUN ./configure --prefix=/opt/postgres \
         --with-libxml --with-uuid=e2fs --with-icu --with-openssl \
         --with-gssapi --disable-werror && \
     make -j"$(nproc)" && \
     make install && \
-    # КРИТИЧНО: Копируем ВСЕ заголовки из исходников в install tree
-    # Это необходимо для расширений Babelfish, которые используют внутренние заголовки
+    # Копируем ВСЕ заголовки из исходников
     cp -rv src/include/* /opt/postgres/include/server/ && \
-    # Копируем сгенерированные .map файлы для модулей кодировок
+    # КРИТИЧНО: Создаём симлинк для путей типа src/include/lib/qunique.h
+    # Babelfish использует полные пути src/include/..., поэтому нужен симлинк
+    mkdir -p /opt/postgres/include/server/src && \
+    ln -s .. /opt/postgres/include/server/src/include && \
+    # Копируем .map файлы для модулей кодировок
     mkdir -p /opt/postgres/include/server/src/backend/utils/mb/Unicode && \
     cp -v src/backend/utils/mb/Unicode/*.map \
        /opt/postgres/include/server/src/backend/utils/mb/Unicode/ && \
@@ -76,7 +79,7 @@ RUN wget -q https://download.osgeo.org/postgis/source/postgis-${POSTGIS_VERSION}
     make -j"$(nproc)" && make install && \
     cd .. && rm -rf postgis-${POSTGIS_VERSION} postgis-${POSTGIS_VERSION}.tar.gz
 
-# 7. СБОРКА ANTLR C++ RUNTIME (глобальная установка)
+# 7. СБОРКА ANTLR C++ RUNTIME
 WORKDIR /build
 RUN cp /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr/thirdparty/antlr/antlr-${ANTLR_VERSION}-complete.jar \
         /usr/local/lib/ && \
