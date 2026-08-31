@@ -32,7 +32,7 @@ RUN dnf install -y epel-release && \
     dnf clean all && \
     rm -rf /var/cache/dnf
 
-# 2. Явное указание путей Java и CMake (ИСПРАВЛЕНО: объединено в одну строку для надежности)
+# 2. Явное указание путей Java и CMake
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk
 ENV PATH="/usr/local/bin:${JAVA_HOME}/bin:${PATH}"
 
@@ -49,13 +49,17 @@ RUN git clone --depth 1 --branch ${PG_BABEL_TAG} \
     git clone --depth 1 --branch ${EXT_BABEL_TAG} \
         https://github.com/babelfish-for-postgresql/babelfish_extensions.git
 
-# 5. Сборка PostgreSQL + копирование .map файлов
+# 5. Сборка PostgreSQL + копирование ВСЕХ заголовков и .map файлов
 WORKDIR /build/postgresql_modified_for_babelfish
 RUN ./configure --prefix=/opt/postgres \
         --with-libxml --with-uuid=e2fs --with-icu --with-openssl \
         --with-gssapi --disable-werror && \
     make -j"$(nproc)" && \
     make install && \
+    # КРИТИЧНО: Копируем ВСЕ заголовки из исходников в install tree
+    # Это необходимо для расширений Babelfish, которые используют внутренние заголовки
+    cp -rv src/include/* /opt/postgres/include/server/ && \
+    # Копируем сгенерированные .map файлы для модулей кодировок
     mkdir -p /opt/postgres/include/server/src/backend/utils/mb/Unicode && \
     cp -v src/backend/utils/mb/Unicode/*.map \
        /opt/postgres/include/server/src/backend/utils/mb/Unicode/ && \
@@ -88,7 +92,7 @@ RUN cp /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr/thirdparty/ant
     find /usr/local/lib /usr/local/lib64 -maxdepth 1 -name "libantlr4-runtime.so*" -exec cp {} /opt/postgres/lib/ \; && \
     ldconfig
 
-# 8. Генерация Makefile для ANTLR внутри babelfishpg_tsql (ИСПРАВЛЕНО: явный путь к Java)
+# 8. Генерация Makefile для ANTLR внутри babelfishpg_tsql
 RUN cd /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr && \
     /usr/local/bin/cmake . \
         -DANTLR_JAR_LOCATION=/usr/local/lib/antlr-${ANTLR_VERSION}-complete.jar \
