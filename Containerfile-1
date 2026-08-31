@@ -11,14 +11,17 @@ ARG CMAKE_VERSION=3.28.3
 ARG POSTGIS_VERSION=3.5.1
 ARG TDS_FDW_VERSION=2.0.4
 
-# 1. Установка зависимостей с правильным подключением репозиториев
+# 1. Установка зависимостей с ПОЛНЫМ набором Perl-модулей
 RUN dnf install -y epel-release && \
     dnf config-manager --set-enabled crb && \
     dnf install -y \
         gcc gcc-c++ make flex bison \
         libicu-devel libxml2-devel openssl-devel \
         libuuid-devel readline-devel zlib-devel \
-        python3-devel perl-devel perl-IPC-Run \
+        python3-devel \
+        perl perl-core perl-devel perl-IPC-Run perl-Test-Simple \
+        perl-Getopt-Long perl-File-Basename perl-File-Copy \
+        perl-File-Compare perl-Text-ParseWords \
         wget unzip git pkgconf-pkg-config krb5-devel \
         geos-devel proj-devel gdal-devel \
         json-c-devel protobuf-c-devel sqlite-devel \
@@ -27,11 +30,11 @@ RUN dnf install -y epel-release && \
     dnf clean all && \
     rm -rf /var/cache/dnf
 
-# 2. Явное указание Java 17 (критично для ANTLR 4.13+)
+# 2. Явное указание Java 17
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
-# Проверка версии Java в логах сборки
+# Проверка Java
 RUN java -version
 
 # 3. Установка cmake
@@ -42,14 +45,14 @@ RUN wget -q https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}
 
 ENV PATH="/usr/local/bin:${PATH}"
 
-# 4. Клонирование репозиториев (с РАЗНЫМИ тегами!)
+# 4. Клонирование репозиториев
 WORKDIR /build
 RUN git clone --depth 1 --branch ${PG_BABEL_TAG} \
         https://github.com/babelfish-for-postgresql/postgresql_modified_for_babelfish.git && \
     git clone --depth 1 --branch ${EXT_BABEL_TAG} \
         https://github.com/babelfish-for-postgresql/babelfish_extensions.git
 
-# 5. Сборка PostgreSQL (БЕЗ параллелизма для диагностики)
+# 5. Сборка PostgreSQL (без параллелизма для лучшей диагностики)
 WORKDIR /build/postgresql_modified_for_babelfish
 RUN ./configure --prefix=/opt/postgres \
         --with-libxml --with-uuid=e2fs --with-icu --with-openssl \
@@ -90,7 +93,6 @@ RUN cd babelfishpg_money && make -j"$(nproc)" && make install && cd .. && \
 ########################################
 FROM almalinux:9 AS runtime
 
-# Установка runtime-зависимостей (также с EPEL/CRB для библиотек)
 RUN dnf install -y epel-release && \
     dnf config-manager --set-enabled crb && \
     dnf install -y \
@@ -100,16 +102,13 @@ RUN dnf install -y epel-release && \
     dnf clean all && \
     rm -rf /var/cache/dnf
 
-# Генерация локали
 RUN localedef -c -f UTF-8 -i en_US en_US.UTF-8
 
-# Создание пользователя postgres
 RUN groupadd -r postgres --gid=26 && \
     useradd -r -g postgres --uid=26 --home-dir=/var/lib/pgsql --shell=/bin/bash postgres && \
     mkdir -p /var/storage/pgsql/data && \
     chown -R postgres:postgres /var/storage/pgsql
 
-# Копирование собранного PostgreSQL
 COPY --from=builder /opt/postgres /opt/postgres
 
 ENV PATH="/opt/postgres/bin:${PATH}"
@@ -117,7 +116,6 @@ ENV PGDATA=/var/storage/pgsql/data
 ENV LANG=en_US.UTF-8
 ENV LC_ALL=en_US.UTF-8
 
-# Копирование скриптов
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY healthcheck.sh /usr/local/bin/healthcheck.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/healthcheck.sh
