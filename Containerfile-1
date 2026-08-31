@@ -54,10 +54,16 @@ RUN cp /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr/thirdparty/ant
 # 8. Генерация Makefile для ANTLR внутри babelfishpg_tsql (с явным путем к Java)
 RUN cd /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr && /usr/local/bin/cmake . -DANTLR_JAR_LOCATION=/usr/local/lib/antlr-${ANTLR_VERSION}-complete.jar -DJava_JAVA_EXECUTABLE=/usr/lib/jvm/java-17-openjdk/bin/java -DCMAKE_PREFIX_PATH=/usr/local -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=ON && make -j"$(nproc)"
 
-# 9. ПОДГОТОВКА К СБОРКЕ: Копируем расширения ВНУТРЬ дерева исходников PostgreSQL
-# Это на 100% решает проблему с путями к src/tools/gen_keywordlist.pl (in-tree сборка)
+# 9. ПОДГОТОВКА К СБОРКЕ: Создаём симлинк /src и копируем расширения
+# КРИТИЧНО: Makefile расширения ищет скрипт по абсолютному пути /src/tools/...
+# из-за того, что top_srcdir в pgxs пустой. Симлинк направит его в исходники PG.
+RUN ln -sfn /build/postgresql_modified_for_babelfish /src
+
 WORKDIR /build/postgresql_modified_for_babelfish/contrib
-RUN cp -r /build/babelfish_extensions/contrib/babelfishpg_money . && cp -r /build/babelfish_extensions/contrib/babelfishpg_common . && cp -r /build/babelfish_extensions/contrib/babelfishpg_tds . && cp -r /build/babelfish_extensions/contrib/babelfishpg_tsql .
+RUN cp -r /build/babelfish_extensions/contrib/babelfishpg_money . && \
+    cp -r /build/babelfish_extensions/contrib/babelfishpg_common . && \
+    cp -r /build/babelfish_extensions/contrib/babelfishpg_tds . && \
+    cp -r /build/babelfish_extensions/contrib/babelfishpg_tsql .
 
 # 10. СБОРКА РАСШИРЕНИЙ BABELEFISH (как родных contrib-модулей)
 WORKDIR /build/postgresql_modified_for_babelfish/contrib/babelfishpg_money
