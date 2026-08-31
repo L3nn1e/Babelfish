@@ -77,7 +77,11 @@ PostGIS / Spatial datatypes и tds_fdw (linked servers) включены по у
 ########################################
 FROM almalinux:9 AS builder
 
-ARG BABEL_TAG=BABEL_5_4_0__PG_17_7
+ARG PG_BABEL_TAG=BABEL_5_4_0__PG_17_7
+# EXT_BABEL_TAG — уточните точным тегом из git ls-remote (см. примечание ниже),
+# т.к. репозитории postgresql_modified_for_babelfish и babelfish_extensions
+# используют РАЗНЫЕ схемы версионирования тегов, а не общий BABEL_TAG.
+ARG EXT_BABEL_TAG=BABEL_5_4_0
 ARG ANTLR_VERSION=4.13.2
 ARG CMAKE_VERSION=3.28.3
 ARG POSTGIS_VERSION=3.5.1
@@ -114,11 +118,16 @@ RUN wget -q https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}
 
 ENV cmake=/usr/local/bin/cmake
 
-# Исходники
+# Исходники. ВАЖНО: перед сборкой проверьте точный тег babelfish_extensions
+# командой (на хосте, не в контейнере):
+#   git ls-remote --tags https://github.com/babelfish-for-postgresql/babelfish_extensions.git | grep -i "5_4_0"
+# и передайте его через --build-arg EXT_BABEL_TAG=..., если он отличается
+# от значения по умолчанию ниже — единый тег для обоих репозиториев не
+# гарантированно существует одновременно в обоих.
 WORKDIR /build
-RUN git clone --depth 1 --branch ${BABEL_TAG} \
+RUN git clone --depth 1 --branch ${PG_BABEL_TAG} \
         https://github.com/babelfish-for-postgresql/postgresql_modified_for_babelfish.git && \
-    git clone --depth 1 --branch ${BABEL_TAG} \
+    git clone --depth 1 --branch ${EXT_BABEL_TAG} \
         https://github.com/babelfish-for-postgresql/babelfish_extensions.git
 
 # Сборка движка PostgreSQL, модифицированного для Babelfish
@@ -325,7 +334,7 @@ SQL
 
     psql -v ON_ERROR_STOP=1 --username postgres <<-SQL
         ALTER SYSTEM SET babelfishpg_tsql.database_name = '${BABELFISH_DB}';
-        ALTER DATABASE ${BABELFISH_DB} SET babelfishpg_tsql.migration_mode = '${BABELFISH_MIGRATION_MODE}';
+        ALTER SYSTEM SET babelfishpg_tsql.migration_mode = '${BABELFISH_MIGRATION_MODE}';
         SELECT pg_reload_conf();
 SQL
 
@@ -382,9 +391,12 @@ chmod +x healthcheck.sh
 ```bash
 cd /opt/babelfish-image
 sudo podman build -t localhost/babelfish:5.4.0-pg17.7 \
-    --build-arg BABEL_TAG=BABEL_5_4_0__PG_17_7 \
+    --build-arg PG_BABEL_TAG=BABEL_5_4_0__PG_17_7 \
+    --build-arg EXT_BABEL_TAG=BABEL_5_4_0 \
     -f Containerfile .
 ```
+
+`EXT_BABEL_TAG` — проверьте перед сборкой командой `git ls-remote --tags` (раздел 3) и передайте актуальное значение, если оно отличается от дефолтного.
 
 Сборка компилирует PostgreSQL + 4 расширения — рассчитывайте на 15–40 минут в зависимости от мощности сервера. Логи компиляции идут в стандартный вывод — если что-то падает, ошибка будет видна прямо в терминале.
 
@@ -533,9 +545,12 @@ name: build-babelfish-image
 on:
   workflow_dispatch:
     inputs:
-      babel_tag:
-        description: 'Тег релиза Babelfish'
+      pg_babel_tag:
+        description: 'Тег релиза postgresql_modified_for_babelfish'
         default: 'BABEL_5_4_0__PG_17_7'
+      ext_babel_tag:
+        description: 'Тег релиза babelfish_extensions (может отличаться от pg_babel_tag — см. раздел 3)'
+        default: 'BABEL_5_4_0'
 
 jobs:
   build:
@@ -544,14 +559,15 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build image with Podman
         run: |
-          podman build -t babelfish:${{ github.event.inputs.babel_tag }} \
-            --build-arg BABEL_TAG=${{ github.event.inputs.babel_tag }} \
+          podman build -t babelfish:${{ github.event.inputs.pg_babel_tag }} \
+            --build-arg PG_BABEL_TAG=${{ github.event.inputs.pg_babel_tag }} \
+            --build-arg EXT_BABEL_TAG=${{ github.event.inputs.ext_babel_tag }} \
             -f Containerfile .
       - name: Push to registry
         run: |
           podman login registry.example.internal -u "${{ secrets.REGISTRY_USER }}" -p "${{ secrets.REGISTRY_PASS }}"
-          podman tag babelfish:${{ github.event.inputs.babel_tag }} registry.example.internal/babelfish:${{ github.event.inputs.babel_tag }}
-          podman push registry.example.internal/babelfish:${{ github.event.inputs.babel_tag }}
+          podman tag babelfish:${{ github.event.inputs.pg_babel_tag }} registry.example.internal/babelfish:${{ github.event.inputs.pg_babel_tag }}
+          podman push registry.example.internal/babelfish:${{ github.event.inputs.pg_babel_tag }}
 ```
 
 ## 9. PostGIS / Spatial Datatypes (уже встроено)
@@ -664,10 +680,13 @@ sudo podman healthcheck run babelfish
 
 Ниже — то, что требует вашей проверки/решения перед первым `podman build`, а не автоматически исправлено в этом гайде:
 
-1. **Разные git-теги для двух репозиториев.** Если решите использовать раздельные `PG_BABEL_TAG`/`EXT_BABEL_TAG` (по образцу вашего варианта) вместо единого `BABEL_TAG` для обоих `git clone` — сначала проверьте на GitHub, что оба тега реально существуют в соответствующих репозиториях для нужной версии (`postgresql_modified_for_babelfish` и `babelfish_extensions`). Иначе `git clone --branch` просто упадёт с "not found" на этапе сборки.
+1. **Разные git-теги для двух репозиториев — подтверждено на практике, требует ручной проверки перед сборкой.** `postgresql_modified_for_babelfish` и `babelfish_extensions` — независимые репозитории с разными схемами версионирования, единый `BABEL_TAG` для обоих `git clone` работает не всегда (конкретно для 5.4.0 тег `BABEL_5_4_0__PG_17_7` существует только в первом репозитории). Перед сборкой уточните точное имя тега для `babelfish_extensions`:
+   ```bash
+   git ls-remote --tags https://github.com/babelfish-for-postgresql/babelfish_extensions.git | grep -i "5_4_0\|5\.4\.0"
+   ```
+   и используйте раздельные `ARG` (например, `PG_BABEL_TAG`/`EXT_BABEL_TAG`) для двух `git clone` в `Containerfile`, если версии тегов различаются.
 2. **Включение PostGIS/tds_fdw в БД по умолчанию.** Сейчас `entrypoint.sh` делает `CREATE EXTENSION` автоматически (управляется `ENABLE_POSTGIS`/`ENABLE_TDS_FDW`). Если хотите включать вручную под конкретную задачу — поменяйте дефолт на `false` или уберите блоки из `entrypoint.sh`.
-3. **`babelfishpg_tsql.database_name`.** В этом гайде GUC выставляется через `ALTER SYSTEM` и `pg_reload_conf()`. Существует альтернативный подход — вообще не задавать этот GUC и полагаться только на `migration_mode`; я не нашёл однозначного авторитетного источника, что один из вариантов строго обязателен для конкретно вашей версии Babelfish. Если после инициализации TDS-подключения не находят нужную базу — это первое, что стоит перепроверить в документации к вашей версии.
-
+3. ~~`babelfishpg_tsql.database_name`~~ — **закрыто.** Официальный `INSTALLING.md.tmpl` проекта (ветка `BABEL_5_X_DEV`) подтверждает: оба GUC — `babelfishpg_tsql.database_name` и `babelfishpg_tsql.migration_mode` — задаются через `ALTER SYSTEM` (глобально), а не через `ALTER DATABASE ... SET`. Гайд уже обновлён под эту схему в разделе 4.
 
 
 | Подход | Время первой настройки | Обслуживание | Контроль |
