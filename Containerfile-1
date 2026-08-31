@@ -49,14 +49,14 @@ RUN git clone --depth 1 --branch ${PG_BABEL_TAG} \
     git clone --depth 1 --branch ${EXT_BABEL_TAG} \
         https://github.com/babelfish-for-postgresql/babelfish_extensions.git
 
-# 5. Сборка PostgreSQL
+# 5. Сборка PostgreSQL (БЕЗ параллелизма для диагностики)
 WORKDIR /build/postgresql_modified_for_babelfish
 RUN ./configure --prefix=/opt/postgres \
         --with-libxml --with-uuid=e2fs --with-icu --with-openssl \
         --with-gssapi --disable-werror && \
-    make -j"$(nproc)" && \
+    make && \
     make install && \
-    cd contrib && make -j"$(nproc)" && make install
+    cd contrib && make && make install
 
 ENV PG_CONFIG=/opt/postgres/bin/pg_config
 
