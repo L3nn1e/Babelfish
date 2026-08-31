@@ -64,7 +64,7 @@ SQL
 
     psql -v ON_ERROR_STOP=1 --username postgres <<-SQL
         ALTER SYSTEM SET babelfishpg_tsql.database_name = '${BABELFISH_DB}';
-        ALTER DATABASE ${BABELFISH_DB} SET babelfishpg_tsql.migration_mode = '${BABELFISH_MIGRATION_MODE}';
+        ALTER SYSTEM SET babelfishpg_tsql.migration_mode = '${BABELFISH_MIGRATION_MODE}';
         SELECT pg_reload_conf();
 SQL
 
