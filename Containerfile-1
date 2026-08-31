@@ -27,11 +27,21 @@ RUN wget -q https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}
 WORKDIR /build
 RUN git clone --depth 1 --branch ${PG_BABEL_TAG} https://github.com/babelfish-for-postgresql/postgresql_modified_for_babelfish.git && git clone --depth 1 --branch ${EXT_BABEL_TAG} https://github.com/babelfish-for-postgresql/babelfish_extensions.git
 
-# 5. Сборка PostgreSQL + хирургическое копирование заголовков
-WORKDIR /build/postgresql_modified_for_babelfish
-RUN ./configure --prefix=/opt/postgres --with-libxml --with-uuid=e2fs --with-icu --with-openssl --with-gssapi --disable-werror && make -j"$(nproc)" && make install && mkdir -p /opt/postgres/include/server/src/include/lib && cp src/include/lib/qunique.h /opt/postgres/include/server/src/include/lib/ && mkdir -p /opt/postgres/include/server/src/backend/utils/mb/Unicode && cp -v src/backend/utils/mb/Unicode/*.map /opt/postgres/include/server/src/backend/utils/mb/Unicode/ && cd contrib && make -j"$(nproc)" && make install
 
-ENV PG_CONFIG=/opt/postgres/bin/pg_config
+# 5. Сборка PostgreSQL + копирование заголовков И скриптов генерации
+WORKDIR /build/postgresql_modified_for_babelfish
+RUN ./configure --prefix=/opt/postgres --with-libxml --with-uuid=e2fs --with-icu --with-openssl --with-gssapi --disable-werror && \
+    make -j"$(nproc)" && make install && \
+    # Хирургическое копирование заголовков для Babelfish
+    mkdir -p /opt/postgres/include/server/src/include/lib && \
+    cp src/include/lib/qunique.h /opt/postgres/include/server/src/include/lib/ && \
+    mkdir -p /opt/postgres/include/server/src/backend/utils/mb/Unicode && \
+    cp -v src/backend/utils/mb/Unicode/*.map /opt/postgres/include/server/src/backend/utils/mb/Unicode/ && \
+    # КРИТИЧНО: Копируем src/tools/ для скриптов генерации (gen_keywordlist.pl и др.)
+    # Расширения Babelfish ищут их через top_srcdir, который указывает на /opt/postgres
+    cp -r src/tools /opt/postgres/src/ && \
+    cd contrib && make -j"$(nproc)" && make install
+
 
 # 6. Сборка PostGIS
 WORKDIR /build
