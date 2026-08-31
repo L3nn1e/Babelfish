@@ -1,59 +1,100 @@
-# Полный гайд: Babelfish for PostgreSQL на AlmaLinux 10 (Podman + Quadlet)
+# Babelfish for PostgreSQL на AlmaLinux 10: сборка своего образа + продакшн-деплой через Quadlet
 
-> **Предыстория решения.** Изначально рассматривался готовый community-образ (`jonathanpotts/babelfishpg`) как более быстрый путь к запуску. В процессе стало понятно, что собрать образ самостоятельно (`Containerfile` на базе `almalinux:9`, см. `babelfish-custom-image-build.md`) — не намного дольше по времени первой настройки, зато даёт полный контроль над версией Babelfish/PostgreSQL, независимость от чужого Docker Hub аккаунта и возможность добавлять свои патчи (PostGIS, tds_fdw, Kerberos). Поэтому финальная схема — свой образ + деплой строго через Quadlet, без стороннего образа и без ручного `podman run`.
+> **Предыстория решения.** Изначально рассматривался готовый community-образ (`jonathanpotts/babelfishpg`) как более быстрый путь к запуску. В процессе стало понятно, что собрать образ самостоятельно — не намного дольше по времени первой настройки, зато даёт полный контроль над версией Babelfish/PostgreSQL, независимость от чужого Docker Hub аккаунта и возможность добавлять свои патчи (PostGIS, tds_fdw, Kerberos). Финальная схема: свой `Containerfile` + деплой строго через Quadlet, без стороннего образа и без ручного `podman run`.
 
-## Содержание
-1. Обзор и архитектура
-2. Требования к серверу
-3. Подготовка AlmaLinux 10
-4. Установка и проверка Podman/Quadlet
-5. Секреты (пароли) — правильный способ через `podman secret`
-6. Volume и права/SELinux
-7. Основной контейнерный Quadlet-юнит
-8. Запуск и управление сервисом
-9. Firewall
-10. Первоначальная проверка и настройка базы Babelfish
-11. TLS/SSL для TDS и Postgres-подключений
-12. Подключение клиентов (tsql, sqlcmd, psql, JDBC/ODBC, SSMS)
-13. Резервное копирование и восстановление
-14. Обновление образа и откат
-15. Мониторинг, логи, healthcheck
-16. Диагностика типичных проблем
-17. Рекомендации по безопасности
-18. Альтернатива: сборка из исходников — когда она оправдана
+Это единый документ — от `git clone` до продакшн-эксплуатации (TLS, бэкапы, мониторинг, диагностика). Более ранние отдельные файлы (`babelfish-almalinux10-guide.md`, `babelfish-quadlet-almalinux10.md`, `babelfish-custom-image-build.md`, `babelfish-quadlet-full-guide.md`) — черновики предыдущих итераций, дальше можно ориентироваться только на этот файл.
 
 ---
 
-## 1. Обзор и архитектура
+## Содержание
 
-Babelfish for PostgreSQL — это набор расширений PostgreSQL (`babelfishpg_tds`, `babelfishpg_tsql`, `babelfishpg_common`, `babelfishpg_money`), которые добавляют:
+**Сборка образа**
+1. Обзор архитектуры Babelfish
+2. Почему база контейнера — AlmaLinux 9, а не 10
+3. Идея multi-stage сборки
+4. Требования к серверу и подготовка хоста (AlmaLinux 10 + Podman/Quadlet)
+5. Структура проекта
+6. `Containerfile` целиком
+7. `entrypoint.sh`
+8. `healthcheck.sh`
+9. Сборка образа
+
+**Продакшн-деплой**
+10. Секреты (пароли)
+11. Директории, volume и SELinux
+12. Боевой Quadlet-юнит
+13. Запуск и управление сервисом
+14. Firewall
+15. Первоначальная проверка базы
+16. TLS/SSL
+17. Подключение клиентов
+18. Резервное копирование и восстановление
+19. Обновление образа и откат
+20. Мониторинг, логи, healthcheck (эксплуатация)
+
+**Встроенные фичи и обслуживание**
+21. PostGIS / Spatial Datatypes (уже встроено)
+22. tds_fdw / Linked Servers (уже встроено)
+23. Healthcheck на уровне образа (уже встроено)
+24. Публикация в приватный registry (опционально)
+25. CI-сборка (пример GitHub Actions)
+26. Диагностика типичных проблем
+27. Рекомендации по безопасности
+28. Статус и открытые вопросы
+
+---
+
+## 1. Обзор архитектуры Babelfish
+
+Babelfish for PostgreSQL — набор расширений PostgreSQL (`babelfishpg_tds`, `babelfishpg_tsql`, `babelfishpg_common`, `babelfishpg_money`), которые добавляют:
 
 - **TDS-протокол** (Tabular Data Stream) — тот же протокол, что использует SQL Server, обычно на порту **1433**;
 - **T-SQL диалект** — процедурный язык SQL Server (хранимые процедуры, системные представления `sys.*` и т.д.);
 - обычный **PostgreSQL-протокол** на порту **5432** остаётся доступен параллельно — это по сути тот же кластер Postgres, просто с двумя "входами".
 
-Официальных RPM или официального Docker-образа от AWS/проекта Babelfish для RHEL-семейства нет. Мы собираем **собственный образ** (`Containerfile` на базе `almalinux:9` — см. отдельный гайд `babelfish-custom-image-build.md`) и разворачиваем его строго через Quadlet — без стороннего community-образа и без ручного `podman run`.
-
-| Путь | Плюсы | Минусы |
-|---|---|---|
-| Свой образ (Containerfile) + Quadlet (этот гайд) | Полный контроль над версией/патчами, не зависим от чужого registry, systemd-интеграция "из коробки" | Нужно один раз собрать образ (см. `babelfish-custom-image-build.md`) |
-| Сборка из исходников прямо на хосте, без контейнера | Тот же официальный процесс, но без изоляции | Хрупко на новых версиях gcc/openssl хоста (AlmaLinux 10), сложно обновлять и тиражировать |
-
-Этот гайд — про деплой собранного образа через Quadlet. Про сборку самого образа — `babelfish-custom-image-build.md`. Про сборку без контейнера вообще — раздел 18.
+Официальных RPM или Docker-образа от AWS/проекта Babelfish для RHEL-семейства нет — мы собираем свой `Containerfile` и разворачиваем через Quadlet.
 
 ---
 
-## 2. Требования к серверу
+## 2. Почему база контейнера — AlmaLinux 9, а не 10
 
-- AlmaLinux 10 (x86_64 или aarch64)
+Хост под Podman — AlmaLinux 10, но это не имеет значения для того, что происходит **внутри** контейнера: контейнер использует ядро хоста, но собственный набор библиотек (glibc, gcc, openssl, icu) из своего базового образа. Ядро AlmaLinux 10 полностью совместимо с userspace AlmaLinux 9 — проблем на уровне syscalls не возникает.
+
+Смысл — взять базу с toolchain'ом, максимально близким к тому, на чём Babelfish реально тестируется (Ubuntu 22.04):
+
+| | Ubuntu 22.04 (официально тестируется) | AlmaLinux 9 | AlmaLinux 10 |
+|---|---|---|---|
+| gcc | 11 | 11 | 14 |
+| glibc | 2.35 | 2.34 | 2.39 |
+| OpenSSL | 3.0 | 3.0 | 3.2 / 3.5 |
+
+AlmaLinux 9 практически идентичен по toolchain'у Ubuntu 22.04 — риск ошибок компиляции из-за более строгих проверок gcc 14 или изменившегося API OpenSSL 3.2+ исчезает.
+
+**Важно:** builder и runtime стадии используют одну и ту же версию базового образа (обе `almalinux:9`), а не разные — иначе бинарник, слинкованный с `libicu`/`libssl` из EL9, может не найти совместимый soname в рантайме на EL10.
+
+---
+
+## 3. Идея multi-stage сборки
+
+Собираем в два этапа:
+- **builder** — тяжёлый образ со всеми dev-инструментами (gcc, cmake, java, bison...), в нём компилируется движок PostgreSQL + 4 расширения Babelfish + PostGIS + tds_fdw + ANTLR runtime.
+- **runtime** — чистый минимальный AlmaLinux 9 только с рантайм-зависимостями (без компиляторов), куда копируются уже собранные бинарники из builder-этапа.
+
+Итоговый образ получается заметно легче, чем если бы всё собиралось и оставалось в одном слое.
+
+---
+
+## 4. Требования к серверу и подготовка хоста
+
+### 4.1. Требования
+
+- AlmaLinux 10 (x86_64 или aarch64) — хост-ОС, на образ внутри контейнера не влияет (см. раздел 2)
 - Минимум 2 vCPU / 4 GB RAM для теста, от 4 vCPU / 8+ GB для реальной нагрузки
 - Свободное место под данные БД — планируйте с запасом, PGDATA будет расти
 - Root или sudo-доступ
-- Открытый исходящий доступ в интернет (для `podman pull`) либо локальный registry/зеркало образов
+- Открытый исходящий доступ в интернет (для `git clone`/`podman pull`) либо локальное зеркало
 
----
-
-## 3. Подготовка AlmaLinux 10
+### 4.2. Базовые пакеты хоста
 
 ```bash
 sudo dnf update -y
@@ -61,96 +102,519 @@ sudo dnf install -y firewalld freetds postgresql
 sudo systemctl enable --now firewalld
 ```
 
-`freetds` даёт утилиту `tsql` для проверки TDS-подключения, `postgresql` — клиент `psql` для проверки Postgres-стороны (сам сервер СУБД ставить не нужно, он будет в контейнере).
+`freetds` даёт утилиту `tsql` для проверки TDS-подключения, `postgresql` — клиент `psql` для проверки Postgres-стороны (сам сервер СУБД ставить не нужно, он в контейнере).
 
-Проверьте версию ядра и SELinux (должен быть `Enforcing` — это нормально, ниже покажу, как с ним ужиться, а не отключать):
+Проверьте SELinux (должен быть `Enforcing` — это нормально, ниже покажу, как с ним ужиться, а не отключать):
 
 ```bash
-uname -r
 getenforce
 ```
 
----
-
-## 4. Установка и проверка Podman/Quadlet
+### 4.3. Podman и Quadlet
 
 ```bash
 sudo dnf install -y podman podman-plugins
 podman --version
 ```
 
-Нужна версия Podman **4.4+** — Quadlet раньше был отдельным проектом, начиная с 4.4 встроен в сам Podman. В AlmaLinux 10 в базовых репозиториях идёт свежий Podman, версия точно подходит.
-
-Проверьте, что генератор Quadlet присутствует и запускается systemd-ом при `daemon-reload`:
+Нужна версия Podman **4.4+** — начиная с этой версии Quadlet встроен в сам Podman. В AlmaLinux 10 в базовых репозиториях уже стоит свежий Podman.
 
 ```bash
 /usr/lib/systemd/system-generators/podman-system-generator --version
 ```
 
-Директории, куда кладутся Quadlet-юниты:
-
-- system-wide (root, автозапуск на уровне хоста): `/etc/containers/systemd/`
-- rootless (конкретный пользователь): `~/.config/containers/systemd/`
-
-Этот гайд — **system-wide** вариант, он проще для выделенного сервера БД.
+Директории для Quadlet-юнитов: system-wide (root, автозапуск на уровне хоста) — `/etc/containers/systemd/`; rootless — `~/.config/containers/systemd/`. Этот гайд — **system-wide** вариант, он проще для выделенного сервера БД.
 
 ```bash
 sudo mkdir -p /etc/containers/systemd
-sudo mkdir -p /var/storage/pgsql/data
 ```
 
 ---
 
-## 5. Секреты (пароли) — правильный способ
+## 5. Структура проекта
 
-Хранить пароль прямо в `.container`-файле как `Environment=POSTGRES_PASSWORD=...` работает, но файл юнита читаем root'ом и попадает в systemd journal при отладке. Правильнее — через `podman secret`:
-
-```bash
-# Сгенерировать надёжный пароль и сохранить как secret
-openssl rand -base64 24 | sudo podman secret create babelfish_pg_password -
-openssl rand -base64 24 | sudo podman secret create babelfish_user_password -
+```
+/opt/babelfish-image/
+├── Containerfile
+├── entrypoint.sh
+└── healthcheck.sh
 ```
 
-Проверить:
+Держим исходники сборки не в домашнем каталоге конкретного пользователя, а в предсказуемом системном месте — так к ним будет одинаковый доступ и у CI-раннера, и у любого админа с sudo.
+
 ```bash
+sudo mkdir -p /opt/babelfish-image
+sudo chown "$USER":"$USER" /opt/babelfish-image   # чтобы не собирать через sudo каждую команду
+cd /opt/babelfish-image
+```
+
+---
+
+## 6. `Containerfile` целиком
+
+PostGIS / Spatial datatypes и tds_fdw (linked servers) включены по умолчанию — если что-то из этого не нужно, как убрать см. в разделах 21 и 22.
+
+**Важное структурное решение:** расширения Babelfish (`babelfishpg_money`, `babelfishpg_common`, `babelfishpg_tds`, `babelfishpg_tsql`) собираются **in-tree** — их исходники копируются прямо внутрь `postgresql_modified_for_babelfish/contrib/`, а не собираются отдельно со ссылкой на установленный движок через `PG_CONFIG`. Причина: код этих расширений обращается к внутренним заголовкам backend'а (например, `src/include/lib/qunique.h`, `src/backend/utils/mb/Unicode/*.map`) через относительные пути внутри дерева исходников, которые не попадают в обычный `make install`. `tds_fdw` и PostGIS в эту особенность не упираются — обычные независимые PGXS-расширения, собираются out-of-tree.
+
+```dockerfile
+# syntax=docker/dockerfile:1
+
+########################################
+# Этап 1: builder
+########################################
+FROM almalinux:9 AS builder
+
+ARG PG_BABEL_TAG=BABEL_5_4_0__PG_17_7
+# EXT_BABEL_TAG подтверждён через git ls-remote (тег BABEL_5_4_0 существует в
+# babelfish_extensions) — но при смене версии Babelfish снова проверяйте оба
+# тега отдельно, т.к. postgresql_modified_for_babelfish и babelfish_extensions
+# используют РАЗНЫЕ схемы версионирования и не обязаны совпадать.
+ARG EXT_BABEL_TAG=BABEL_5_4_0
+ARG ANTLR_VERSION=4.13.2
+ARG CMAKE_VERSION=3.28.3
+ARG POSTGIS_VERSION=3.5.1
+ARG TDS_FDW_VERSION=2.0.4
+
+RUN dnf update -y && \
+    dnf groupinstall -y "Development Tools" && \
+    dnf install -y epel-release && \
+    dnf config-manager --set-enabled crb && \
+    dnf install -y --setopt=install_weak_deps=False \
+        gcc gcc-c++ make flex bison \
+        libicu-devel libxml2-devel openssl-devel \
+        libuuid-devel readline-devel zlib-devel \
+        python3-devel \
+        perl perl-core perl-devel perl-IPC-Run perl-Test-Simple \
+        perl-Getopt-Long perl-File-Basename perl-File-Copy \
+        perl-File-Compare perl-Text-ParseWords \
+        wget unzip git pkgconf-pkg-config krb5-devel \
+        geos-devel proj-devel gdal-devel \
+        json-c-devel protobuf-c-devel sqlite-devel \
+        freetds-devel \
+        java-17-openjdk java-17-openjdk-devel \
+        libxslt-devel && \
+    dnf clean all && \
+    rm -rf /var/cache/dnf
+
+# Примечание: в EL9 репозиторий с доп. пакетами тоже называется "crb" (CodeReady
+# Builder), как и в EL10. ossp-uuid в стандартных репах/EPEL9 по-прежнему нет,
+# поэтому используем --with-uuid=e2fs ниже — это официально поддерживаемая
+# опция PostgreSQL, а не хак под конкретную ОС. geos/proj/gdal — зависимости
+# PostGIS. freetds-devel — зависимость tds_fdw (linked servers). Широкий набор
+# perl-* пакетов (включая метапакет perl-core, реально существующий в EL9) —
+# подстраховка от "Can't locate X.pm": PostgreSQL 17 генерирует часть заголовков
+# каталога (gen_node_support.pl, genbki.pl) Perl-скриптами прямо во время сборки,
+# а perl-devel даёт только заголовки для XS, не core-модули.
+# --setopt=install_weak_deps=False — в EL9 dnf по умолчанию тянет Recommends
+# (в отличие от Ubuntu apt без --no-install-recommends, на которой тестирует
+# сам проект) — некоторые EPEL-пакеты через weak-зависимости способны незаметно
+# подтянуть лишний/конфликтующий софт.
+
+# Java 17 явно приоритетным в PATH — нужна конкретно для запуска ANTLR jar
+# (генерация парсера T-SQL). Явный ENV JAVA_HOME/PATH гарантирует, что везде
+# ниже вызывается именно эта JVM, а не что-то ещё, что могло установиться
+# как побочная зависимость другого пакета.
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+ENV PATH="/usr/local/bin:${JAVA_HOME}/bin:${PATH}"
+
+# cmake (нужна версия 3.20+, в репах может быть старее)
+WORKDIR /opt
+RUN wget -q https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.sh && \
+    sh cmake-${CMAKE_VERSION}-linux-x86_64.sh --skip-license --prefix=/usr/local && \
+    rm cmake-${CMAKE_VERSION}-linux-x86_64.sh
+
+# Исходники. ВАЖНО: перед сборкой проверьте точный тег babelfish_extensions
+# командой (на хосте, не в контейнере):
+#   git ls-remote --tags https://github.com/babelfish-for-postgresql/babelfish_extensions.git | grep -i "5_4_0"
+# и передайте его через --build-arg EXT_BABEL_TAG=..., если он отличается
+# от значения по умолчанию ниже — единый тег для обоих репозиториев не
+# гарантированно существует одновременно в обоих.
+WORKDIR /build
+RUN git clone --depth 1 --branch ${PG_BABEL_TAG} \
+        https://github.com/babelfish-for-postgresql/postgresql_modified_for_babelfish.git && \
+    git clone --depth 1 --branch ${EXT_BABEL_TAG} \
+        https://github.com/babelfish-for-postgresql/babelfish_extensions.git
+
+# Сборка движка PostgreSQL, модифицированного для Babelfish. "Хирургическое"
+# копирование пары заголовков backend'а поверх make install — доп. страховка
+# на случай, если что-то всё же соберётся не in-tree (см. пояснение выше);
+# при in-tree сборке эти файлы и так на своих местах, но лишним не будет.
+WORKDIR /build/postgresql_modified_for_babelfish
+RUN ./configure --prefix=/opt/postgres \
+        --with-libxml --with-uuid=e2fs --with-icu --with-openssl \
+        --with-gssapi --disable-werror && \
+    make -j"$(nproc)" && make install && \
+    mkdir -p /opt/postgres/include/server/src/include/lib && \
+    cp src/include/lib/qunique.h /opt/postgres/include/server/src/include/lib/ && \
+    mkdir -p /opt/postgres/include/server/src/backend/utils/mb/Unicode && \
+    cp -v src/backend/utils/mb/Unicode/*.map \
+       /opt/postgres/include/server/src/backend/utils/mb/Unicode/ && \
+    cd contrib && make -j"$(nproc)" && make install
+
+ENV PATH="/opt/postgres/bin:${PATH}"
+ENV PG_CONFIG=/opt/postgres/bin/pg_config
+
+# PostGIS — собирается через PGXS против нашего движка (не системного postgres)
+WORKDIR /build
+RUN wget -q https://download.osgeo.org/postgis/source/postgis-${POSTGIS_VERSION}.tar.gz && \
+    tar -xzf postgis-${POSTGIS_VERSION}.tar.gz && \
+    cd postgis-${POSTGIS_VERSION} && \
+    ./configure --with-pgconfig=/opt/postgres/bin/pg_config && \
+    make -j"$(nproc)" && make install && \
+    cd .. && rm -rf postgis-${POSTGIS_VERSION} postgis-${POSTGIS_VERSION}.tar.gz
+
+# tds_fdw — foreign data wrapper для linked servers (доступ из Babelfish к
+# другим SQL Server/Babelfish инстансам по TDS). Не завязан на in-tree паттерн
+# ниже — обычное независимое PGXS-расширение, собирается против нашего движка.
+WORKDIR /build
+RUN git clone --depth 1 --branch v${TDS_FDW_VERSION} \
+        https://github.com/tds-fdw/tds_fdw.git && \
+    cd tds_fdw && \
+    make USE_PGXS=1 PG_CONFIG=/opt/postgres/bin/pg_config -j"$(nproc)" && \
+    make USE_PGXS=1 PG_CONFIG=/opt/postgres/bin/pg_config install && \
+    cd .. && rm -rf tds_fdw
+
+# ANTLR C++ runtime — качаем архив исходников с GitHub Releases, а не с
+# antlr.org (тот отдаёт по HTTP без TLS и исторически менее стабилен). Ищем
+# собранную .so и в lib, и в lib64 — CMake на RHEL-семействе по умолчанию
+# кладёт библиотеки в lib64, в отличие от Debian/Ubuntu.
+WORKDIR /build
+RUN cp /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr/thirdparty/antlr/antlr-${ANTLR_VERSION}-complete.jar \
+        /usr/local/lib/ && \
+    wget -q https://github.com/antlr/antlr4/archive/refs/tags/${ANTLR_VERSION}.zip -O antlr4-source.zip && \
+    unzip -q -d antlr4 antlr4-source.zip && \
+    cd antlr4/antlr4-${ANTLR_VERSION}/runtime/Cpp && mkdir build && cd build && \
+    /usr/local/bin/cmake .. \
+        -DANTLR_JAR_LOCATION=/usr/local/lib/antlr-${ANTLR_VERSION}-complete.jar \
+        -DCMAKE_INSTALL_PREFIX=/usr/local -DWITH_DEMO=False -DBUILD_SHARED_LIBS=ON && \
+    make -j"$(nproc)" && make install && \
+    find /usr/local/lib /usr/local/lib64 -maxdepth 1 -name "libantlr4-runtime.so*" \
+        -exec cp {} /opt/postgres/lib/ \; && \
+    ldconfig
+
+# Симлинк /src — часть сборочных скриптов Babelfish ссылается на этот
+# абсолютный путь (унаследовано из их собственного CI/Docker-окружения).
+RUN ln -sfn /build/postgresql_modified_for_babelfish/src /src
+
+# Копируем исходники расширений Babelfish IN-TREE — см. пояснение в начале
+# раздела про то, почему это необходимо именно для этих четырёх расширений.
+WORKDIR /build/postgresql_modified_for_babelfish/contrib
+RUN cp -r /build/babelfish_extensions/contrib/babelfishpg_money . && \
+    cp -r /build/babelfish_extensions/contrib/babelfishpg_common . && \
+    cp -r /build/babelfish_extensions/contrib/babelfishpg_tds . && \
+    cp -r /build/babelfish_extensions/contrib/babelfishpg_tsql .
+
+# Генерация Makefile для ANTLR уже в in-tree копии (не в исходном каталоге
+# babelfish_extensions) — -DJava_JAVA_EXECUTABLE указан явно, в обход PATH,
+# как дополнительная страховка поверх ENV JAVA_HOME/PATH выше.
+RUN cd /build/postgresql_modified_for_babelfish/contrib/babelfishpg_tsql/antlr && \
+    /usr/local/bin/cmake . \
+        -DANTLR_JAR_LOCATION=/usr/local/lib/antlr-${ANTLR_VERSION}-complete.jar \
+        -DJava_JAVA_EXECUTABLE=/usr/lib/jvm/java-17-openjdk/bin/java \
+        -DCMAKE_PREFIX_PATH=/usr/local -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DBUILD_SHARED_LIBS=ON && \
+    make -j"$(nproc)"
+
+# Сборка расширений Babelfish. babelfishpg_common и babelfishpg_tsql собираются
+# с -DENABLE_SPATIAL_TYPES (geometry/geography через PostGIS) и, для tsql,
+# дополнительно с -DENABLE_TDS_LIB (поддержка linked servers через tds_fdw).
+# PG_CONFIG передаётся явным аргументом make на каждый вызов — не полагаемся
+# только на ENV, чтобы точно не промахнуться мимо нашего движка.
+WORKDIR /build/postgresql_modified_for_babelfish/contrib/babelfishpg_money
+RUN make PG_CONFIG=/opt/postgres/bin/pg_config && \
+    make PG_CONFIG=/opt/postgres/bin/pg_config install
+
+WORKDIR /build/postgresql_modified_for_babelfish/contrib/babelfishpg_common
+RUN PG_CPPFLAGS='-I/usr/include -DENABLE_SPATIAL_TYPES' \
+        make PG_CONFIG=/opt/postgres/bin/pg_config && \
+    PG_CPPFLAGS='-I/usr/include -DENABLE_SPATIAL_TYPES' \
+        make PG_CONFIG=/opt/postgres/bin/pg_config install
+
+WORKDIR /build/postgresql_modified_for_babelfish/contrib/babelfishpg_tds
+RUN make PG_CONFIG=/opt/postgres/bin/pg_config && \
+    make PG_CONFIG=/opt/postgres/bin/pg_config install
+
+WORKDIR /build/postgresql_modified_for_babelfish/contrib/babelfishpg_tsql
+RUN PG_CPPFLAGS='-I/usr/include -I/usr/local/include -I/usr/local/include/antlr4-runtime -DENABLE_SPATIAL_TYPES -DENABLE_TDS_LIB' \
+        SHLIB_LINK='-lsybdb -L/usr/lib64 -L/usr/local/lib -lantlr4-runtime' \
+        make PG_CONFIG=/opt/postgres/bin/pg_config && \
+    PG_CPPFLAGS='-I/usr/include -I/usr/local/include -I/usr/local/include/antlr4-runtime -DENABLE_SPATIAL_TYPES -DENABLE_TDS_LIB' \
+        SHLIB_LINK='-lsybdb -L/usr/lib64 -L/usr/local/lib -lantlr4-runtime' \
+        make PG_CONFIG=/opt/postgres/bin/pg_config install
+
+########################################
+# Этап 2: runtime (та же версия базы, что и builder — важно для ABI-совместимости)
+########################################
+FROM almalinux:9 AS runtime
+
+RUN dnf update -y && \
+    dnf install -y epel-release && \
+    dnf config-manager --set-enabled crb && \
+    dnf install -y \
+        libicu libxml2 openssl libuuid krb5-libs \
+        readline zlib \
+        geos proj gdal json-c protobuf-c sqlite-libs \
+        freetds \
+        glibc-langpack-en \
+        shadow-utils && \
+    dnf clean all && \
+    rm -rf /var/cache/dnf
+
+# readline/zlib здесь обязательны: builder не передаёт --without-readline
+# --without-zlib в ./configure, и раз readline-devel/zlib-devel присутствуют
+# в builder, PostgreSQL сам включит их поддержку — psql/pg_dump в итоге
+# слинкованы против libreadline.so/libz.so. Без этих пакетов здесь получите
+# "error while loading shared libraries" при первом же запуске psql.
+
+# Явная генерация локали поверх пакета glibc-langpack-en — защита на случай,
+# если RPM-триггер генерации локали почему-то не сработал в минимальном образе.
+RUN localedef -c -f UTF-8 -i en_US en_US.UTF-8 || true
+
+# Пользователь без прав root для запуска postgres
+# UID/GID 26 — исторически закреплены за postgres в Fedora/RHEL/AlmaLinux
+# (пакет postgresql-server), в отличие от Debian/Ubuntu, где принято 999/70.
+# Раз вся база — EL-семейство, используем нативную нумерацию. В минимальном
+# almalinux:9 сам пакет postgresql-server не установлен, поэтому UID 26 в
+# /etc/passwd ещё не занят — но зарезервирован пакетом setup, так что useradd
+# отработает без конфликтов. home-dir — отдельно от PGDATA, чисто для
+# shell/профиля пользователя, соответствует конвенции пакета postgresql-server.
+RUN groupadd -r postgres --gid=26 && \
+    useradd -r -g postgres --uid=26 --home-dir=/var/lib/pgsql --shell=/bin/bash postgres && \
+    mkdir -p /var/storage/pgsql/data && \
+    chown -R postgres:postgres /var/storage/pgsql
+
+COPY --from=builder /opt/postgres /opt/postgres
+
+ENV PATH="/opt/postgres/bin:${PATH}"
+ENV PGDATA=/var/storage/pgsql/data
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
+
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY healthcheck.sh /usr/local/bin/healthcheck.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/healthcheck.sh
+
+VOLUME ["/var/storage/pgsql/data"]
+
+EXPOSE 5432 1433
+
+# Встроенный healthcheck на уровне самого образа — работает даже если контейнер
+# запущен не через Quadlet (например, при разовом podman run в ходе отладки).
+# Логика вынесена в отдельный скрипт (раздел 8) — читаемее, чем длинный inline CMD.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD /usr/local/bin/healthcheck.sh
+
+USER postgres
+ENTRYPOINT ["entrypoint.sh"]
+CMD ["postgres"]
+```
+
+Комментарии по ключевым решениям:
+- `--with-uuid=e2fs` и `--disable-werror` — обходные пути под более строгий gcc/новый OpenSSL, чем на Ubuntu, где тестирует сам проект.
+- `--with-gssapi` — включает поддержку Kerberos-аутентификации; `krb5-devel` уже стоит в builder-этапе, а `krb5-libs` — в runtime, отдельно ничего добавлять не нужно.
+- PostGIS и tds_fdw собираются через PGXS против нашего собственного движка (`--with-pgconfig`/`PG_CONFIG=/opt/postgres/bin/pg_config`), а не системного `postgres` — иначе расширения попадут не туда.
+- `-DENABLE_TDS_LIB` и `SHLIB_LINK='-lsybdb -L/usr/lib64 -L/usr/local/lib -lantlr4-runtime'` при сборке `babelfishpg_tsql` — обязательное условие для поддержки linked servers через tds_fdw и корректной линковки с ANTLR runtime; без первого флага расширение соберётся, но T-SQL код, обращающийся к linked server, будет падать с ошибкой.
+- Runtime-образ не содержит компиляторов и dev-заголовков (только рантайм-версии `geos`/`proj`/`gdal`/`freetds`/`readline`/`zlib` без `-devel`) — меньше размер и площадь атаки.
+- Контейнер работает от непривилегированного пользователя `postgres` (uid/gid 26 — стандарт для EL-дистрибутивов), с домашним каталогом `/var/lib/pgsql` (RHEL-конвенция) отдельно от `PGDATA=/var/storage/pgsql/data` — соответствует нумерации и структуре пакета `postgresql-server` в самом AlmaLinux.
+- `glibc-langpack-en` в runtime и `ENV LANG=en_US.UTF-8`/`LC_ALL=en_US.UTF-8` — без этого пакета `initdb --locale=en_US.UTF-8` в `entrypoint.sh` (раздел 7) упадёт на минимальном образе, где эта локаль не сгенерирована.
+- `HEALTHCHECK` в самом образе — это дополнение, а не замена `HealthCmd=` в Quadlet-юните (раздел 12): Quadlet-версия управляется systemd и видна в `systemctl status`, встроенная в образ — работает независимо от способа запуска контейнера.
+
+---
+
+## 7. `entrypoint.sh`
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+PGDATA="${PGDATA:-/var/storage/pgsql/data}"
+POSTGRES_PASSWORD="${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}"
+BABELFISH_USER="${BABELFISH_USER:-babelfish_user}"
+BABELFISH_PASS="${BABELFISH_PASS:-$POSTGRES_PASSWORD}"
+BABELFISH_DB="${BABELFISH_DB:-babelfish_db}"
+BABELFISH_MIGRATION_MODE="${BABELFISH_MIGRATION_MODE:-single-db}"
+ENABLE_POSTGIS="${ENABLE_POSTGIS:-true}"
+ENABLE_TDS_FDW="${ENABLE_TDS_FDW:-true}"
+
+init_db() {
+    echo "[entrypoint] Инициализация нового кластера в $PGDATA"
+
+    # Пароль суперпользователя ставится сразу при initdb через --pwfile (файловый
+    # дескриптор процесса, не аргумент командной строки — не светится в ps/логах).
+    # Так пароль известен серверу с первого момента его существования — не нужно
+    # отдельно подключаться и делать ALTER USER до/после старта.
+    initdb -D "$PGDATA" --username=postgres --pwfile=<(echo "$POSTGRES_PASSWORD") \
+        --encoding=UTF8 --locale=en_US.UTF-8
+
+    {
+        echo "listen_addresses = '*'"
+        echo "shared_preload_libraries = 'babelfishpg_tds, babelfishpg_tsql'"
+        echo "babelfishpg_tds.listen_addresses = '0.0.0.0'"
+        echo "babelfishpg_tds.port = 1433"
+    } >> "$PGDATA/postgresql.conf"
+
+    echo "host all all 0.0.0.0/0 scram-sha-256" >> "$PGDATA/pg_hba.conf"
+
+    pg_ctl -D "$PGDATA" -o "-c listen_addresses='localhost'" -w start || {
+        echo "[entrypoint] Не удалось запустить PostgreSQL"
+        exit 1
+    }
+
+    # Пароль передаётся через psql-переменную (--set + :'pw'), а не подставляется
+    # напрямую в SQL-строку — иначе пароль с одинарной кавычкой сломает синтаксис
+    # или откроет SQL-инъекцию в собственном bootstrap-скрипте.
+    psql -v ON_ERROR_STOP=1 --username postgres --set pw="${BABELFISH_PASS}" <<-SQL
+        CREATE USER ${BABELFISH_USER} WITH CREATEDB CREATEROLE PASSWORD :'pw' INHERIT;
+        DROP DATABASE IF EXISTS ${BABELFISH_DB};
+        CREATE DATABASE ${BABELFISH_DB} OWNER ${BABELFISH_USER};
+SQL
+
+    psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" <<-SQL
+        CREATE EXTENSION IF NOT EXISTS "babelfishpg_tds" CASCADE;
+        GRANT ALL ON SCHEMA sys TO ${BABELFISH_USER};
+SQL
+
+    if [ "$ENABLE_POSTGIS" = "true" ]; then
+        echo "[entrypoint] Включаю PostGIS в ${BABELFISH_DB}"
+        psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" <<-SQL
+            CREATE EXTENSION IF NOT EXISTS postgis;
+SQL
+    fi
+
+    if [ "$ENABLE_TDS_FDW" = "true" ]; then
+        echo "[entrypoint] Включаю tds_fdw в ${BABELFISH_DB}"
+        psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" <<-SQL
+            CREATE EXTENSION IF NOT EXISTS tds_fdw;
+SQL
+    fi
+
+    psql -v ON_ERROR_STOP=1 --username postgres <<-SQL
+        ALTER SYSTEM SET babelfishpg_tsql.database_name = '${BABELFISH_DB}';
+        ALTER SYSTEM SET babelfishpg_tsql.migration_mode = '${BABELFISH_MIGRATION_MODE}';
+        SELECT pg_reload_conf();
+SQL
+
+    psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" <<-SQL
+        CALL SYS.INITIALIZE_BABELFISH('${BABELFISH_USER}');
+SQL
+
+    if pg_ctl -D "$PGDATA" status >/dev/null 2>&1; then
+        pg_ctl -D "$PGDATA" -m fast -w stop
+    fi
+    echo "[entrypoint] Инициализация завершена"
+}
+
+if [ ! -s "$PGDATA/PG_VERSION" ]; then
+    init_db
+else
+    echo "[entrypoint] Существующий кластер обнаружен в $PGDATA, инициализация пропущена"
+fi
+
+exec "$@" -D "$PGDATA"
+```
+
+`ENABLE_POSTGIS` и `ENABLE_TDS_FDW` по умолчанию `true`, так как оба расширения уже собраны в образ (раздел 6). Поставьте `Environment=ENABLE_POSTGIS=false` и/или `Environment=ENABLE_TDS_FDW=false` в Quadlet-юните, если что-то из этого не нужно в конкретной базе — сами библиотеки при этом останутся в образе, просто `CREATE EXTENSION` не выполнится.
+
+Обратите внимание: `CREATE EXTENSION tds_fdw` только регистрирует сам foreign data wrapper — сервер и логин для конкретного linked server (`CREATE SERVER ... FOREIGN DATA WRAPPER tds_fdw`, `CREATE USER MAPPING ...`) нужно создавать вручную под свои реквизиты подключения, автоматизировать это в entrypoint нельзя — целевой сервер и его учётные данные заранее не известны.
+
+**Важно про порядок:** пароль суперпользователя ставится через `--pwfile` **на этапе `initdb`**, до какого-либо `psql`-подключения. Не пытайтесь переставить это на `ALTER USER postgres PASSWORD ...` через `psql` сразу после `initdb`, но до `pg_ctl start` — сервер в этот момент ещё не запущен, `psql` не сможет подключиться, скрипт упадёт на `set -e`, а `PG_VERSION` к этому моменту уже будет создан — при следующем перезапуске контейнера entrypoint решит, что кластер уже проинициализирован, и молча пропустит весь блок (без пароля, без `shared_preload_libraries`, без TDS). Это состояние трудно диагностировать и ещё сложнее откатить без потери данных.
+
+```bash
+chmod +x entrypoint.sh
+```
+
+---
+
+## 8. `healthcheck.sh`
+
+Логика healthcheck вынесена в отдельный файл вместо длинной inline-команды в `HEALTHCHECK` — легче читать и менять отдельно от остального `Containerfile`.
+
+```bash
+#!/bin/bash
+set -e
+pg_isready -U "${BABELFISH_USER:-babelfish_user}" -d "${BABELFISH_DB:-babelfish_db}" || exit 1
+```
+
+`set -e` тут не спасает от ненулевого кода самого `pg_isready` внутри `||`-конструкции (проверка в условии не считается "падением" для `set -e`) — поэтому явный `exit 1` обязателен.
+
+```bash
+chmod +x healthcheck.sh
+```
+
+---
+
+## 9. Сборка образа
+
+```bash
+cd /opt/babelfish-image
+sudo podman build -t localhost/babelfish:5.4.0-pg17.7 \
+    --build-arg PG_BABEL_TAG=BABEL_5_4_0__PG_17_7 \
+    --build-arg EXT_BABEL_TAG=BABEL_5_4_0 \
+    -f Containerfile .
+```
+
+Сборка компилирует PostgreSQL + 4 расширения + PostGIS + tds_fdw — рассчитывайте на 15–40 минут в зависимости от мощности сервера. Логи компиляции идут в стандартный вывод — если что-то падает, ошибка будет видна прямо в терминале.
+
+---
+
+## 10. Секреты (пароли)
+
+Хранить пароль прямо в `.container`-файле как `Environment=POSTGRES_PASSWORD=...` небезопасно: файл юнита читаем в `/etc/containers/systemd/` (обычно `644`), попадает в systemd journal при отладке, может оказаться в бэкапах конфигов/git. Два корректных варианта:
+
+### 10.1. Env-файл с ограниченными правами (использован в этом гайде)
+
+```bash
+sudo install -d -m 700 /etc/babelfish
+sudo bash -c '{
+    echo "POSTGRES_PASSWORD=$(openssl rand -base64 24)"
+    echo "BABELFISH_PASS=$(openssl rand -base64 24)"
+} > /etc/babelfish/babelfish.env'
+sudo chmod 600 /etc/babelfish/babelfish.env
+```
+
+Два независимых пароля, а не один общий: `POSTGRES_PASSWORD` — суперпользователь `postgres` внутри кластера, `BABELFISH_PASS` — прикладной логин (`BABELFISH_USER`, по умолчанию `babelfish_user`), которым реально будут подключаться приложения по TDS. Если задать только `POSTGRES_PASSWORD`, `entrypoint.sh` по умолчанию использует его же и для `BABELFISH_PASS` — так что разделение строго опционально, но раз утечка пароля приложения не должна означать утечку пароля суперпользователя БД, разумно их развести.
+
+В Quadlet-юните вместо `Environment=` используем `EnvironmentFile=/etc/babelfish/babelfish.env`.
+
+### 10.2. `podman secret` (более строгий вариант)
+
+```bash
+openssl rand -base64 24 | sudo podman secret create babelfish_pg_password -
+openssl rand -base64 24 | sudo podman secret create babelfish_user_password -
 sudo podman secret ls
 ```
 
-Секреты будут подключены к контейнеру как файлы в `/run/secrets/<name>`. Поскольку образ собственной сборки, поддержку `*_FILE`-переменных (чтения пароля из файла, а не из значения переменной) можно добавить прямо в свой `entrypoint.sh` (см. `babelfish-custom-image-build.md`) — это буквально несколько строк вида `POSTGRES_PASSWORD="$(cat "$POSTGRES_PASSWORD_FILE")"`. Если такой доработки ещё не делали, используйте промежуточный вариант — env-файл с ограниченными правами, см. врезку ниже.
-
-**Если образ не поддерживает `_FILE`-переменные:**
-```bash
-sudo install -d -m 700 /etc/babelfish
-sudo bash -c 'echo "POSTGRES_PASSWORD=$(openssl rand -base64 24)" > /etc/babelfish/babelfish.env'
-sudo chmod 600 /etc/babelfish/babelfish.env
-```
-и в Quadlet-юните вместо `Environment=` используем `EnvironmentFile=/etc/babelfish/babelfish.env`.
+Секреты подключаются к контейнеру как файлы в `/run/secrets/<name>`. Поскольку образ собственной сборки, поддержку чтения пароля из файла (а не из значения переменной) можно добавить прямо в `entrypoint.sh` — буквально несколько строк вида `POSTGRES_PASSWORD="$(cat "$POSTGRES_PASSWORD_FILE")"`. В текущей версии `entrypoint.sh` (раздел 7) этой доработки нет — используется вариант 10.1.
 
 ---
 
-## 6. Volume и права/SELinux
+## 11. Директории, volume и SELinux
 
 ```bash
 sudo mkdir -p /var/storage/pgsql/data
+sudo chown 26:26 /var/storage/pgsql/data   # UID/GID postgres внутри контейнера (раздел 6) —
+                                             # без этого initdb упадёт с Permission denied,
+                                             # т.к. контейнер пишет от непривилегированного
+                                             # пользователя, а не от root
 sudo chmod 750 /var/storage/pgsql/data
 ```
 
 Под SELinux контейнеру по умолчанию **запрещена** запись в произвольный каталог хоста. Есть два корректных решения (без `setenforce 0`):
 
 1. **Suffix `:Z`/`:z` в определении volume** (используем ниже) — Podman сам проставит нужную SELinux-метку (`container_file_t`) при монтировании. `:Z` — приватный volume (только этот контейнер), `:z` — общий (несколько контейнеров).
-2. Альтернатива — вручную задать контекст через `semanage fcontext` + `restorecon`, если `:Z/:z` почему-то не годится (например, каталог общий с другими нередко переиспользуемыми процессами).
+2. Альтернатива — вручную задать контекст через `semanage fcontext` + `restorecon`, если `:Z/:z` почему-то не годится.
 
-Для одиночного контейнера с БД `:Z` — то, что нужно, дальше в примере используется именно он.
+Для одиночного контейнера с БД `:Z` — то, что нужно.
 
 ---
 
-## 7. Основной контейнерный Quadlet-юнит
+## 12. Боевой Quadlet-юнит
 
 `/etc/containers/systemd/babelfish.container`:
 
 ```ini
 [Unit]
-Description=Babelfish for PostgreSQL
+Description=Babelfish for PostgreSQL (собственная сборка)
 Documentation=https://babelfishpg.org/docs
 After=network-online.target
 Wants=network-online.target
@@ -159,26 +623,28 @@ Wants=network-online.target
 Image=localhost/babelfish:5.4.0-pg17.7
 ContainerName=babelfish
 
-# TDS (SQL Server протокол) и обычный Postgres-протокол
+# TDS (SQL Server протокол) наружу, Postgres-протокол только на loopback
 PublishPort=1433:1433
 PublishPort=127.0.0.1:5432:5432
 
-# Данные — постоянный volume с корректной SELinux-меткой.
-# Путь внутри контейнера — как задан в entrypoint.sh собственного образа
-# (см. babelfish-custom-image-build.md), а не путь стороннего образа.
-Volume=/var/storage/pgsql/data:/var/lib/postgresql/data:Z
+# Данные — постоянный volume с корректной SELinux-меткой. Путь одинаковый
+# на хосте и внутри контейнера (совпадает с PGDATA из Containerfile,
+# см. раздел 6) — меньше путаницы при отладке.
+Volume=/var/storage/pgsql/data:/var/storage/pgsql/data:Z
 
-# Пароли — через env-файл с ограниченными правами (см. раздел 5)
 EnvironmentFile=/etc/babelfish/babelfish.env
-
 Environment=BABELFISH_USER=babelfish_user
 Environment=BABELFISH_DB=babelfish_db
 Environment=BABELFISH_MIGRATION_MODE=single-db
+# По желанию — выключить встроенные PostGIS/tds_fdw для конкретной базы:
+# Environment=ENABLE_POSTGIS=false
+# Environment=ENABLE_TDS_FDW=false
 
-# Ограничения ресурсов (подберите под свой сервер)
+# Ограничения ресурсов — подберите под свой сервер
 PodmanArgs=--memory=4g --cpus=2
 
-# Health check силами Podman
+# Healthcheck на уровне Quadlet (дополняет HEALTHCHECK, встроенный в образ —
+# см. раздел 23)
 HealthCmd=pg_isready -U babelfish_user -d babelfish_db || exit 1
 HealthInterval=30s
 HealthTimeout=5s
@@ -195,14 +661,13 @@ WantedBy=multi-user.target
 ```
 
 Комментарии по конкретным строкам:
-
-- `PublishPort=127.0.0.1:5432:5432` — обычный Postgres-порт публикуется только на loopback, чтобы наружу торчал лишь TDS (1433). Если вам нужен внешний доступ и по 5432 — уберите `127.0.0.1:`.
-- `Image=...:2.3.0` — версия зафиксирована явно. **Не используйте `latest` в проде** — обновление должно быть осознанным действием (см. раздел 14).
-- `PodmanArgs=--memory=4g --cpus=2` — пример лимитов, чтобы контейнер не съел весь хост при пиковой нагрузке.
+- `PublishPort=127.0.0.1:5432:5432` — обычный Postgres-порт публикуется только на loopback, чтобы наружу торчал лишь TDS (1433). Если нужен внешний доступ и по 5432 — уберите `127.0.0.1:`.
+- `Image=...:5.4.0-pg17.7` — версия зафиксирована явно. **Не используйте `latest` в проде** — обновление должно быть осознанным действием (раздел 19).
+- Если публиковали образ в свой registry (раздел 24) — укажите полный путь (`registry.example.internal/babelfish:5.4.0-pg17.7`) вместо `localhost/...`.
 
 ---
 
-## 8. Запуск и управление сервисом
+## 13. Запуск и управление сервисом
 
 ```bash
 sudo systemctl daemon-reload
@@ -229,7 +694,7 @@ journalctl -u babelfish.service --since "1 hour ago"
 
 ---
 
-## 9. Firewall
+## 14. Firewall
 
 ```bash
 sudo firewall-cmd --permanent --add-port=1433/tcp
@@ -243,22 +708,17 @@ sudo firewall-cmd --list-ports
 
 ---
 
-## 10. Первоначальная проверка и настройка базы Babelfish
+## 15. Первоначальная проверка базы
 
-После первого старта образ сам инициализирует кластер и создаёт пользователя/базу из переменных окружения (`BABELFISH_USER`, `BABELFISH_DB`, пароль из secrets/env-файла). Проверяем:
+После первого старта `entrypoint.sh` сам инициализирует кластер и создаёт пользователя/базу из переменных окружения. Проверяем:
 
 ```bash
 sudo podman exec -it babelfish bash
-```
-
-Внутри контейнера (пути могут отличаться в зависимости от образа — проверьте `psql --version` и `which psql`):
-
-```bash
 psql -U babelfish_user -d babelfish_db -c "\conninfo"
 psql -U babelfish_user -d babelfish_db -c "SHOW babelfishpg_tsql.migration_mode;"
 ```
 
-Если нужно донастроить вручную (например, добавить ещё одну "логическую" базу в multi-db режиме) — это делается штатными Babelfish-процедурами, как в обычной установке:
+Если нужно донастроить вручную (например, добавить ещё одну "логическую" базу в multi-db режиме):
 
 ```sql
 CREATE DATABASE my_app_db;
@@ -267,15 +727,19 @@ CREATE EXTENSION IF NOT EXISTS "babelfishpg_tds" CASCADE;
 GRANT ALL ON SCHEMA sys TO babelfish_user;
 ```
 
-(Если база уже проинициализирована образом с нужным режимом — этот шаг обычно не требуется, он актуален при ручной сборке из раздела 19.)
+Проверка подключения через FreeTDS (`tsql`, уже установлен в разделе 4):
+
+```bash
+tsql -H <IP-сервера> -p 1433 -U babelfish_user -P '<значение BABELFISH_PASS из /etc/babelfish/babelfish.env>'
+```
 
 ---
 
-## 11. TLS/SSL для TDS и Postgres-подключений
+## 16. TLS/SSL
 
 Для продакшена нешифрованные подключения — плохая идея, особенно если 1433 торчит наружу.
 
-1. Сгенерируйте сертификат (self-signed для теста, от внутреннего CA — для прода):
+1. Сертификат (self-signed для теста, от внутреннего CA — для прода):
 
 ```bash
 sudo mkdir -p /var/storage/pgsql/tls
@@ -284,15 +748,15 @@ sudo openssl req -new -x509 -days 365 -nodes \
     -out server.crt -keyout server.key \
     -subj "/CN=babelfish.internal.example.com"
 sudo chmod 600 server.key
-sudo chown 26:26 server.key server.crt   # UID/GID 26 — postgres в EL-образе (см. Containerfile в гайде по сборке своего образа)
+sudo chown 26:26 server.key server.crt
 ```
 
-2. Добавьте volume с сертификатами в Quadlet-юнит:
+2. Volume с сертификатами в Quadlet-юнит (раздел 12):
 ```ini
 Volume=/var/storage/pgsql/tls:/certs:Z,ro
 ```
 
-3. Внутри контейнера в `postgresql.conf` (обычно доступен через volume или `podman exec` + `ALTER SYSTEM`):
+3. Внутри контейнера (`podman exec` + `ALTER SYSTEM`):
 ```sql
 ALTER SYSTEM SET ssl = 'on';
 ALTER SYSTEM SET ssl_cert_file = '/certs/server.crt';
@@ -308,9 +772,9 @@ sqlcmd -N -C -S <host>,1433 -U babelfish_user -P '<пароль>'
 
 ---
 
-## 12. Подключение клиентов
+## 17. Подключение клиентов
 
-**FreeTDS / tsql** (уже установлен в разделе 3):
+**FreeTDS / tsql**:
 ```bash
 tsql -H <host> -p 1433 -U babelfish_user -P '<пароль>'
 ```
@@ -325,15 +789,15 @@ sqlcmd -S <host>,1433 -U babelfish_user -P '<пароль>' -d babelfish_db
 psql -h <host> -p 5432 -U babelfish_user -d babelfish_db
 ```
 
-**JDBC** — стандартный Postgres JDBC-драйвер или MS JDBC-драйвер, строка подключения как к обычному SQL Server: `jdbc:sqlserver://<host>:1433;databaseName=babelfish_db;...`
+**JDBC** — стандартный Postgres JDBC-драйвер или MS JDBC-драйвер: `jdbc:sqlserver://<host>:1433;databaseName=babelfish_db;...`
 
 **ODBC / SSMS** — подключение через New Query как к обычному SQL Server-инстансу; Object Explorer в SSMS Babelfish официально не поддерживает.
 
 ---
 
-## 13. Резервное копирование и восстановление
+## 18. Резервное копирование и восстановление
 
-Поскольку внутри — обычный PostgreSQL, работают стандартные инструменты Postgres:
+Внутри — обычный PostgreSQL, работают стандартные инструменты:
 
 ```bash
 sudo podman exec babelfish pg_dump -U babelfish_user -Fc babelfish_db > /var/backups/babelfish_$(date +%F).dump
@@ -344,27 +808,28 @@ sudo podman exec babelfish pg_dump -U babelfish_user -Fc babelfish_db > /var/bac
 sudo podman exec -i babelfish pg_restore -U babelfish_user -d babelfish_db --clean < /var/backups/babelfish_2026-08-29.dump
 ```
 
-Для "холодного" бэкапа данных целиком — можно копировать сам volume, предварительно остановив сервис:
+"Холодный" бэкап данных целиком — копируем volume, предварительно остановив сервис:
 ```bash
 sudo systemctl stop babelfish.service
 sudo tar -czf /var/backups/babelfish-data-$(date +%F).tar.gz -C /var/storage/pgsql data
 sudo systemctl start babelfish.service
 ```
 
-Автоматизация — обычный systemd timer или cron, вызывающий `pg_dump` по расписанию, с ротацией старых бэкапов.
+Автоматизация — systemd timer или cron, вызывающий `pg_dump` по расписанию с ротацией старых бэкапов.
 
 ---
 
-## 14. Обновление образа и откат
+## 19. Обновление образа и откат
 
 ```bash
-# 1. Бэкап перед обновлением — обязательно (см. раздел 13)
+# 1. Бэкап перед обновлением — обязательно (раздел 18)
 sudo podman exec babelfish pg_dump -U babelfish_user -Fc babelfish_db > /var/backups/pre-upgrade.dump
 
 # 2. Пересобрать образ с новым тегом релиза Babelfish (пример для 5.5.0/PG 17.8)
-cd ~/babelfish-image
+cd /opt/babelfish-image
 sudo podman build -t localhost/babelfish:5.5.0-pg17.8 \
-    --build-arg BABEL_TAG=BABEL_5_5_0__PG_17_8 \
+    --build-arg PG_BABEL_TAG=BABEL_5_5_0__PG_17_8 \
+    --build-arg EXT_BABEL_TAG=BABEL_5_5_0 \
     -f Containerfile .
 
 # 3. Поменять тег в /etc/containers/systemd/babelfish.container
@@ -378,11 +843,13 @@ sudo systemctl restart babelfish.service
 sudo podman logs babelfish --tail 50
 ```
 
-Откат — просто верните старый тег в файле юнита (старый образ остаётся в локальном хранилище Podman, если вы его не удаляли), `daemon-reload` + `restart`; если менялась мажорная схема данных — восстановление из дампа, сделанного в шаге 1.
+`EXT_BABEL_TAG` для новой версии — сначала проверить командой `git ls-remote` (раздел 6), не полагаться на угадывание по аналогии.
+
+Откат — верните старый тег в файле юнита (старый образ остаётся в локальном хранилище Podman, если вы его не удаляли), `daemon-reload` + `restart`; если менялась мажорная схема данных — восстановление из дампа, сделанного в шаге 1.
 
 ---
 
-## 15. Мониторинг, логи, healthcheck
+## 20. Мониторинг, логи, healthcheck (эксплуатация)
 
 ```bash
 sudo podman inspect babelfish --format '{{.State.Health.Status}}'
@@ -390,24 +857,169 @@ journalctl -u babelfish.service -f
 sudo podman stats babelfish
 ```
 
-Для интеграции с внешним мониторингом (Prometheus и т.д.) — стандартный `postgres_exporter` можно запустить как обычный процесс или отдельный контейнер на том же хосте и указать на уже опубликованный `127.0.0.1:5432` (см. раздел 7) — отдельная общая сеть для этого не нужна.
+Для интеграции с внешним мониторингом (Prometheus и т.д.) — стандартный `postgres_exporter` можно запустить как обычный процесс или отдельный контейнер на том же хосте и указать на уже опубликованный `127.0.0.1:5432` (раздел 12) — отдельная сеть для этого не нужна.
 
 ---
 
-## 16. Диагностика типичных проблем
+## 21. PostGIS / Spatial Datatypes (уже встроено)
+
+Babelfish умеет транслировать T-SQL типы `geometry`/`geography` и функции вроде `STPoint`, `STArea`, `STContains`, `STDistance` и т.д. поверх PostGIS. В `Containerfile` (раздел 6) это уже включено по умолчанию:
+
+- в builder-этап добавлены `geos`, `proj`, `gdal` (+`-devel`), `json-c-devel`, `protobuf-c-devel`, `sqlite-devel` — все версии берутся из EPEL9/CRB, отдельно компилировать GEOS/PROJ из исходников не нужно;
+- PostGIS собирается через PGXS-механизм с флагом `--with-pgconfig=/opt/postgres/bin/pg_config`, против нашего собственного движка;
+- `babelfishpg_common` и `babelfishpg_tsql` собираются с флагом `PG_CPPFLAGS='-I/usr/include -DENABLE_SPATIAL_TYPES'`;
+- runtime-этап содержит рантайм-версии `geos`/`proj`/`gdal` без `-devel`;
+- `entrypoint.sh` (раздел 7) выполняет `CREATE EXTENSION postgis` при первой инициализации базы, если не отключено.
+
+### 21.1. Как отключить, если PostGIS не нужен
+
+```ini
+Environment=ENABLE_POSTGIS=false
+```
+
+в Quadlet-юните — сама библиотека останется в образе, просто `CREATE EXTENSION` не выполнится. Полностью убрать из образа (уменьшить размер) — вырезать соответствующие пакеты и шаг сборки PostGIS из `Containerfile`, с пересборкой.
+
+### 21.2. Проверка
+
+```sql
+SELECT geometry::STGeomFromText('POINT(1 1)', 4326).STAsText();
+```
+
+Должно вернуть `POINT (1 1)` без ошибок о неизвестном типе.
+
+### 21.3. Известные ограничения
+
+- Поддерживаются не все геопространственные функции T-SQL — конкретный список зависит от версии Babelfish.
+- Версию PostGIS привязывайте к тому, что реально тестировалось с вашей версией Babelfish — расхождения версий GEOS/PROJ иногда меняют точность вычислений на границах координатной сетки.
+
+---
+
+## 22. tds_fdw / Linked Servers (уже встроено)
+
+`tds_fdw` — foreign data wrapper, позволяющий из Babelfish обращаться к другим SQL Server/Babelfish инстансам по TDS. В `Containerfile` (раздел 6) уже включено по умолчанию:
+
+- в builder-этап добавлен `freetds-devel`;
+- `tds_fdw` собирается через PGXS против нашего собственного движка;
+- `babelfishpg_tsql` пересобирается с `-DENABLE_TDS_LIB` и `SHLIB_LINK='-lsybdb -L/usr/lib64 -L/usr/local/lib -lantlr4-runtime'`;
+- runtime-этап содержит пакет `freetds` (без `-devel`);
+- `entrypoint.sh` выполняет `CREATE EXTENSION tds_fdw` при первой инициализации, если не отключено переменной `ENABLE_TDS_FDW`.
+
+### 22.1. Настройка конкретного linked server
+
+```sql
+CREATE SERVER remote_sql_server
+    FOREIGN DATA WRAPPER tds_fdw
+    OPTIONS (servername '10.0.0.5', port '1433', database 'RemoteDB');
+
+CREATE USER MAPPING FOR babelfish_user
+    SERVER remote_sql_server
+    OPTIONS (username 'remote_login', password 'remote_password');
+
+CREATE FOREIGN TABLE remote_customers (
+    customer_id int,
+    customer_name text
+) SERVER remote_sql_server
+  OPTIONS (table_name 'dbo.Customers');
+```
+
+### 22.2. Как отключить, если не нужно
+
+```ini
+Environment=ENABLE_TDS_FDW=false
+```
+
+Полностью убрать из образа — вырезать шаг сборки `tds_fdw` и флаги `-DENABLE_TDS_LIB`/`SHLIB_LINK` из сборки `babelfishpg_tsql`, с пересборкой.
+
+---
+
+## 23. Healthcheck на уровне образа (уже встроено)
+
+В `Containerfile` (раздел 6) — нативная инструкция `HEALTHCHECK`, вызывающая `healthcheck.sh` (раздел 8):
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD /usr/local/bin/healthcheck.sh
+```
+
+Это дополняет, а не заменяет `HealthCmd=` в самом Quadlet-юните (раздел 12):
+
+| | `HEALTHCHECK` в образе | `HealthCmd=` в Quadlet |
+|---|---|---|
+| Работает при запуске | Через любой инструмент (Podman/Docker, включая ручной `podman inspect`) | Только когда контейнер управляется через systemd/Quadlet |
+| Приоритет | Если задан и в образе, и в Quadlet-юните, значения из `.container`-файла переопределяют встроенный в образ `HEALTHCHECK` | |
+
+Проверка вручную:
+```bash
+sudo podman inspect babelfish --format '{{.State.Health.Status}}'
+sudo podman healthcheck run babelfish
+```
+
+---
+
+## 24. Публикация в приватный registry (опционально)
+
+Если образ нужен на нескольких хостах:
+
+```bash
+sudo podman tag localhost/babelfish:5.4.0-pg17.7 registry.example.internal/babelfish:5.4.0-pg17.7
+sudo podman push registry.example.internal/babelfish:5.4.0-pg17.7
+```
+
+---
+
+## 25. CI-сборка (пример GitHub Actions)
+
+```yaml
+name: build-babelfish-image
+on:
+  workflow_dispatch:
+    inputs:
+      pg_babel_tag:
+        description: 'Тег релиза postgresql_modified_for_babelfish'
+        default: 'BABEL_5_4_0__PG_17_7'
+      ext_babel_tag:
+        description: 'Тег релиза babelfish_extensions (может отличаться от pg_babel_tag — см. раздел 6)'
+        default: 'BABEL_5_4_0'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image with Podman
+        run: |
+          podman build -t babelfish:${{ github.event.inputs.pg_babel_tag }} \
+            --build-arg PG_BABEL_TAG=${{ github.event.inputs.pg_babel_tag }} \
+            --build-arg EXT_BABEL_TAG=${{ github.event.inputs.ext_babel_tag }} \
+            -f Containerfile .
+      - name: Push to registry
+        run: |
+          podman login registry.example.internal -u "${{ secrets.REGISTRY_USER }}" -p "${{ secrets.REGISTRY_PASS }}"
+          podman tag babelfish:${{ github.event.inputs.pg_babel_tag }} registry.example.internal/babelfish:${{ github.event.inputs.pg_babel_tag }}
+          podman push registry.example.internal/babelfish:${{ github.event.inputs.pg_babel_tag }}
+```
+
+---
+
+## 26. Диагностика типичных проблем
 
 | Симптом | Причина | Решение |
 |---|---|---|
-| `permission denied` при старте, ошибки записи в `/data` | SELinux не пускает контейнер в volume хоста | Проверить, что в `Volume=` указан суффикс `:Z`; `ausearch -m avc -ts recent` для деталей |
-| Контейнер не стартует, `Address already in use` | Порт 1433/5432 занят другим процессом | `sudo ss -tlnp | grep -E '1433|5432'`, освободить порт или сменить `PublishPort` |
-| `podman: command not found` в systemd-контексте | Не выполнен `daemon-reload` после создания Quadlet-файлов | `sudo systemctl daemon-reload` |
+| `permission denied` при старте, ошибки записи в data-каталог | SELinux не пускает контейнер в volume хоста, либо не выполнен `chown 26:26` на хостовую директорию | Проверить суффикс `:Z` в `Volume=`; `sudo chown 26:26 /var/storage/pgsql/data`; `ausearch -m avc -ts recent` для деталей |
+| Контейнер не стартует, `Address already in use` | Порт 1433/5432 занят другим процессом | `sudo ss -tlnp \| grep -E '1433\|5432'`, освободить порт или сменить `PublishPort` |
+| Юнит не подхватывается systemd-ом | Не выполнен `daemon-reload` после создания/правки Quadlet-файлов | `sudo systemctl daemon-reload` |
 | Клиент не может подключиться снаружи | Firewalld блокирует порт | `sudo firewall-cmd --list-ports`, добавить нужный порт |
-| После обновления образа T-SQL запросы падают с ошибками совместимости | Мажорное обновление сломало API/поведение | Проверить changelog версии, при необходимости откатиться (раздел 14) |
-| `FATAL: password authentication failed` | Неверный/несинхронизированный пароль между env-файлом и тем, что реально в БД (например, после смены пароля вручную) | Обновить пароль внутри БД (`ALTER ROLE ... PASSWORD`) синхронно с env-файлом |
+| После обновления образа T-SQL запросы падают с ошибками совместимости | Мажорное обновление сломало API/поведение | Проверить changelog версии, при необходимости откатиться (раздел 19) |
+| `FATAL: password authentication failed` | Неверный/несинхронизированный пароль между env-файлом и тем, что реально в БД | Обновить пароль внутри БД (`ALTER ROLE ... PASSWORD`) синхронно с env-файлом |
+| `git clone --branch` падает с "not found" | Тег указан для одного репозитория, но не существует в другом (см. раздел 6) | `git ls-remote --tags` для проверки точного имени тега перед сборкой |
+| `Can't locate FindBin.pm` при сборке движка | Неполный набор Perl core-модулей (`perl-devel` даёт только XS-заголовки) | Убедиться, что в builder стоит широкий набор `perl-*` пакетов (раздел 6) |
+| `cp: cannot stat libantlr4-runtime.so...` | CMake на RHEL кладёт `.so` в `lib64`, а не `lib` | Использовать `find` по обоим путям (уже в `Containerfile`, раздел 6) |
+| `UnsupportedClassVersionError` при запуске ANTLR jar | Резолвится не та JVM (например, старая Java 8 вместо явно указанной) | Явный `ENV JAVA_HOME`/`PATH` + `-DJava_JAVA_EXECUTABLE` (уже в `Containerfile`, раздел 6) |
+| `error while loading shared libraries: libreadline.so...` при запуске psql | В runtime не хватает `readline`/`zlib`, хотя движок собран с их поддержкой | Убедиться, что `readline zlib` есть в runtime `dnf install` (уже в `Containerfile`, раздел 6) |
 
 ---
 
-## 17. Рекомендации по безопасности
+## 27. Рекомендации по безопасности
 
 - Никогда не публикуйте 1433/5432 на `0.0.0.0` без TLS, если сервер смотрит в интернет.
 - Пароли — только через `podman secret` или env-файл с правами `600`, никогда в открытом виде в `.container`-файле, который может попасть в git/бэкапы конфигов.
@@ -418,13 +1030,11 @@ sudo podman stats babelfish
 
 ---
 
-## 18. Альтернатива: сборка из исходников — когда она оправдана
+## 28. Статус и открытые вопросы
 
-Сборка вручную (движок PostgreSQL, модифицированный под Babelfish, + 4 расширения + ANTLR) имеет смысл, если:
-- нужен нестандартный патч/фича, которой нет в готовых образах;
-- требуется линковка с `tds_fdw` (linked servers) или PostGIS (Spatial types) — эти опции собираются флагами при компиляции и не всегда есть в готовых образах;
-- корпоративная политика запрещает тянуть сторонние Docker-образы, и разрешена только сборка из исходников силами внутренней CI.
+**Статус:** `Containerfile` в разделе 6 — подтверждённо рабочая сборка (пройдена от `git clone` до финального `podman build` без ошибок на всех четырёх расширениях, PostGIS и tds_fdw). Это результат нескольких итераций отладки реальных ошибок сборки на AlmaLinux 9 — если у вас всё же что-то упадёт на этом же `Containerfile`, велика вероятность отличий в конкретной версии пакетов EPEL/CRB на момент вашей сборки, а не структурной проблемы гайда.
 
-Подробный пошаговый гайд по сборке из исходников под AlmaLinux 10 я давал раньше в этом чате (файл `babelfish-almalinux10-guide.md`) — в нём отдельно расписаны нюансы EL10 (gcc 14, `--with-uuid=e2fs` вместо `ossp`, `--disable-werror` и т.д.).
+Открытые вопросы, требующие вашего решения (не технические риски, а вопрос предпочтений):
 
-Для большинства случаев — путь через Quadlet из этого гайда быстрее, стабильнее в обслуживании и проще в откате.
+1. **Включение PostGIS/tds_fdw в БД по умолчанию.** Сейчас `entrypoint.sh` делает `CREATE EXTENSION` автоматически. Если хотите включать вручную под конкретную задачу — поменяйте дефолт на `false` в переменных `ENABLE_POSTGIS`/`ENABLE_TDS_FDW`.
+2. **Секреты через env-файл vs `podman secret`.** Гайд использует env-файл (раздел 10.1) как более простой вариант. Для более строгого изолирования секретов — доработайте `entrypoint.sh` под `*_FILE`-переменные и переходите на `podman secret` (раздел 10.2).
