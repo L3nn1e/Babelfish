@@ -92,7 +92,7 @@ RUN dnf update -y && \
     dnf groupinstall -y "Development Tools" && \
     dnf install -y epel-release && \
     dnf config-manager --set-enabled crb && \
-    dnf install -y \
+    dnf install -y --setopt=install_weak_deps=False \
         libicu-devel libxml2-devel openssl-devel \
         libuuid-devel \
         gcc gcc-c++ make flex bison \
@@ -110,10 +110,17 @@ RUN dnf update -y && \
 # поэтому используем --with-uuid=e2fs ниже — это официально поддерживаемая
 # опция PostgreSQL, а не хак под конкретную ОС. geos/proj/gdal — зависимости
 # PostGIS. freetds-devel — зависимость tds_fdw (linked servers).
-# perl-FindBin/perl-Data-Dumper — PostgreSQL 17 генерирует часть заголовков
+# перл-FindBin/perl-Data-Dumper — PostgreSQL 17 генерирует часть заголовков
 # каталога (gen_node_support.pl, genbki.pl) Perl-скриптами прямо во время
 # сборки; perl-devel даёт только заголовки для XS, не core-модули — в EL их
 # нужно ставить отдельными подпакетами, иначе "Can't locate FindBin.pm".
+# --setopt=install_weak_deps=False — в EL9 dnf по умолчанию тянет Recommends
+# (в отличие от Ubuntu apt без --no-install-recommends, на которой тестирует
+# сам проект). Конкретно gdal-devel из EPEL может подтянуть старый java-1.8
+# как weak-зависимость java-биндингов GDAL — а он перебивает java-21 в
+# alternatives и ломает ANTLR jar (UnsupportedClassVersionError: class file
+# version 55 не читается JVM, понимающей только до 52). Отключение weak deps
+# устраняет причину, а не подчищает симптом постфактум.
 
 # cmake (нужна версия 3.20+, в репах может быть старее)
 WORKDIR /opt
@@ -184,6 +191,16 @@ RUN cp /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr/thirdparty/ant
 # Сборка расширений Babelfish. babelfishpg_common и babelfishpg_tsql собираются
 # с -DENABLE_SPATIAL_TYPES (geometry/geography через PostGIS) и, для tsql,
 # дополнительно с -DENABLE_TDS_LIB (поддержка linked servers через tds_fdw).
+#
+# Известная проблема проекта (упоминается в их же README/issues): CMakeLists.txt
+# в contrib/babelfishpg_tsql/antlr содержит pkg_check_modules(UUID REQUIRED uuid),
+# которая на RHEL-семействе часто не находит uuid.pc даже при установленном
+# libuuid-devel (в отличие от Ubuntu, где путь для pkg-config другой). Официальная
+# рекомендация — закомментировать эту строку; делаем это автоматически через sed,
+# чтобы не редактировать исходники вручную при каждой сборке.
+RUN sed -i 's/^\(\s*pkg_check_modules(UUID REQUIRED uuid)\)/#\1/' \
+        /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr/CMakeLists.txt || true
+
 WORKDIR /build/babelfish_extensions/contrib
 RUN cd babelfishpg_money  && make -j"$(nproc)" && make install && cd .. && \
     cd babelfishpg_common && \
