@@ -97,7 +97,7 @@ RUN dnf update -y && \
         libuuid-devel \
         gcc gcc-c++ make flex bison \
         readline-devel zlib-devel \
-        python3-devel perl-devel \
+        python3-devel perl-devel perl-FindBin perl-Data-Dumper \
         java-21-openjdk java-21-openjdk-devel \
         wget unzip git pkgconf-pkg-config krb5-devel \
         geos geos-devel proj proj-devel gdal gdal-devel \
@@ -110,6 +110,10 @@ RUN dnf update -y && \
 # поэтому используем --with-uuid=e2fs ниже — это официально поддерживаемая
 # опция PostgreSQL, а не хак под конкретную ОС. geos/proj/gdal — зависимости
 # PostGIS. freetds-devel — зависимость tds_fdw (linked servers).
+# perl-FindBin/perl-Data-Dumper — PostgreSQL 17 генерирует часть заголовков
+# каталога (gen_node_support.pl, genbki.pl) Perl-скриптами прямо во время
+# сборки; perl-devel даёт только заголовки для XS, не core-модули — в EL их
+# нужно ставить отдельными подпакетами, иначе "Can't locate FindBin.pm".
 
 # cmake (нужна версия 3.20+, в репах может быть старее)
 WORKDIR /opt
