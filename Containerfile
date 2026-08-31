@@ -5,7 +5,12 @@
 ########################################
 FROM almalinux:9 AS builder
 
-ARG BABEL_TAG=BABEL_5_4_0__PG_17_7
+ARG PG_BABEL_TAG=BABEL_5_4_0__PG_17_7
+# EXT_BABEL_TAG подтверждён через git ls-remote (тег BABEL_5_4_0 существует в
+# babelfish_extensions) — но при смене версии Babelfish снова проверяйте оба
+# тега отдельно, т.к. postgresql_modified_for_babelfish и babelfish_extensions
+# используют РАЗНЫЕ схемы версионирования и не обязаны совпадать.
+ARG EXT_BABEL_TAG=BABEL_5_4_0
 ARG ANTLR_VERSION=4.13.2
 ARG CMAKE_VERSION=3.28.3
 ARG POSTGIS_VERSION=3.5.1
@@ -42,11 +47,16 @@ RUN wget -q https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}
 
 ENV cmake=/usr/local/bin/cmake
 
-# Исходники
+# Исходники. ВАЖНО: перед сборкой проверьте точный тег babelfish_extensions
+# командой (на хосте, не в контейнере):
+#   git ls-remote --tags https://github.com/babelfish-for-postgresql/babelfish_extensions.git | grep -i "5_4_0"
+# и передайте его через --build-arg EXT_BABEL_TAG=..., если он отличается
+# от значения по умолчанию ниже — единый тег для обоих репозиториев не
+# гарантированно существует одновременно в обоих.
 WORKDIR /build
-RUN git clone --depth 1 --branch ${BABEL_TAG} \
+RUN git clone --depth 1 --branch ${PG_BABEL_TAG} \
         https://github.com/babelfish-for-postgresql/postgresql_modified_for_babelfish.git && \
-    git clone --depth 1 --branch ${BABEL_TAG} \
+    git clone --depth 1 --branch ${EXT_BABEL_TAG} \
         https://github.com/babelfish-for-postgresql/babelfish_extensions.git
 
 # Сборка движка PostgreSQL, модифицированного для Babelfish
