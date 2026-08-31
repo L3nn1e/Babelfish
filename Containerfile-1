@@ -104,18 +104,18 @@ RUN cd /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr && \
         -DBUILD_SHARED_LIBS=ON && \
     make -j"$(nproc)"
 
-# 10. Сборка расширений Babelfish
+# 10. Сборка расширений Babelfish (БЕЗ параллелизма для выявления точной ошибки)
 WORKDIR /build/babelfish_extensions/contrib
-RUN cd babelfishpg_money && make -j"$(nproc)" && make install && cd .. && \
+RUN cd babelfishpg_money && make && make install && cd .. && \
     cd babelfishpg_common && \
-        PG_CPPFLAGS='-I/opt/postgres/include/server -I/usr/include -DENABLE_SPATIAL_TYPES' make -j"$(nproc)" && \
+        PG_CPPFLAGS='-I/opt/postgres/include/server -I/usr/include -DENABLE_SPATIAL_TYPES' make && \
         PG_CPPFLAGS='-I/opt/postgres/include/server -I/usr/include -DENABLE_SPATIAL_TYPES' make install && \
         cd .. && \
-    cd babelfishpg_tds && make -j"$(nproc)" && make install && cd .. && \
+    cd babelfishpg_tds && make && make install && cd .. && \
     cd babelfishpg_tsql && \
         PG_CPPFLAGS='-I/opt/postgres/include/server -I/usr/include -I/usr/local/include -I/usr/local/include/antlr4-runtime -DENABLE_SPATIAL_TYPES -DENABLE_TDS_LIB' \
         SHLIB_LINK='-lsybdb -L/usr/lib64 -L/usr/local/lib -lantlr4-runtime' \
-            make -j"$(nproc)" && \
+            make && \
         PG_CPPFLAGS='-I/opt/postgres/include/server -I/usr/include -I/usr/local/include -I/usr/local/include/antlr4-runtime -DENABLE_SPATIAL_TYPES -DENABLE_TDS_LIB' \
         SHLIB_LINK='-lsybdb -L/usr/lib64 -L/usr/local/lib -lantlr4-runtime' \
             make install
