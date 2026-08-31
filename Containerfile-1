@@ -11,7 +11,7 @@ ARG CMAKE_VERSION=3.28.3
 ARG POSTGIS_VERSION=3.5.1
 ARG TDS_FDW_VERSION=2.0.4
 
-# 1. Установка зависимостей с ПОЛНЫМ набором Perl-модулей
+# 1. Установка зависимостей
 RUN dnf install -y epel-release && \
     dnf config-manager --set-enabled crb && \
     dnf install -y \
@@ -26,16 +26,14 @@ RUN dnf install -y epel-release && \
         geos-devel proj-devel gdal-devel \
         json-c-devel protobuf-c-devel sqlite-devel \
         freetds-devel \
-        java-17-openjdk java-17-openjdk-devel && \
+        java-17-openjdk java-17-openjdk-devel \
+        libxslt-devel && \
     dnf clean all && \
     rm -rf /var/cache/dnf
 
-# 2. Явное указание Java 17
+# 2. Java 17 (критично для ANTLR 4.13+)
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
-
-# Проверка Java
-RUN java -version
 
 # 3. Установка cmake
 WORKDIR /opt
@@ -45,21 +43,26 @@ RUN wget -q https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}
 
 ENV PATH="/usr/local/bin:${PATH}"
 
-# 4. Клонирование репозиториев
+# 4. Клонирование репозиториев (РАЗНЫЕ теги!)
 WORKDIR /build
 RUN git clone --depth 1 --branch ${PG_BABEL_TAG} \
         https://github.com/babelfish-for-postgresql/postgresql_modified_for_babelfish.git && \
     git clone --depth 1 --branch ${EXT_BABEL_TAG} \
         https://github.com/babelfish-for-postgresql/babelfish_extensions.git
 
-# 5. Сборка PostgreSQL (без параллелизма для лучшей диагностики)
+# 5. Сборка PostgreSQL + КОПИРОВАНИЕ .map файлов
 WORKDIR /build/postgresql_modified_for_babelfish
 RUN ./configure --prefix=/opt/postgres \
         --with-libxml --with-uuid=e2fs --with-icu --with-openssl \
         --with-gssapi --disable-werror && \
-    make && \
+    make -j"$(nproc)" && \
     make install && \
-    cd contrib && make && make install
+    # КРИТИЧНО: Копируем сгенерированные .map файлы для расширений Babelfish
+    # Без этих файлов babelfishpg_common не скомпилирует модули кодировок
+    mkdir -p /opt/postgres/include/server/src/backend/utils/mb/Unicode && \
+    cp -v src/backend/utils/mb/Unicode/*.map \
+       /opt/postgres/include/server/src/backend/utils/mb/Unicode/ && \
+    cd contrib && make -j"$(nproc)" && make install
 
 ENV PG_CONFIG=/opt/postgres/bin/pg_config
 
@@ -72,19 +75,19 @@ RUN wget -q https://download.osgeo.org/postgis/source/postgis-${POSTGIS_VERSION}
     make -j"$(nproc)" && make install && \
     cd .. && rm -rf postgis-${POSTGIS_VERSION} postgis-${POSTGIS_VERSION}.tar.gz
 
-# 7. Сборка расширений Babelfish (БЕЗ параллелизма для диагностики)
+# 7. Сборка расширений Babelfish (с правильным include path)
 WORKDIR /build/babelfish_extensions/contrib
-RUN cd babelfishpg_money && make && make install && cd .. && \
+RUN cd babelfishpg_money && make -j"$(nproc)" && make install && cd .. && \
     cd babelfishpg_common && \
-        PG_CPPFLAGS='-I/usr/include -DENABLE_SPATIAL_TYPES' make && \
-        PG_CPPFLAGS='-I/usr/include -DENABLE_SPATIAL_TYPES' make install && \
+        PG_CPPFLAGS='-I/opt/postgres/include/server -I/usr/include -DENABLE_SPATIAL_TYPES' make -j"$(nproc)" && \
+        PG_CPPFLAGS='-I/opt/postgres/include/server -I/usr/include -DENABLE_SPATIAL_TYPES' make install && \
         cd .. && \
-    cd babelfishpg_tds && make && make install && cd .. && \
+    cd babelfishpg_tds && make -j"$(nproc)" && make install && cd .. && \
     cd babelfishpg_tsql && \
-        PG_CPPFLAGS='-I/usr/include -DENABLE_SPATIAL_TYPES -DENABLE_TDS_LIB' \
+        PG_CPPFLAGS='-I/opt/postgres/include/server -I/usr/include -DENABLE_SPATIAL_TYPES -DENABLE_TDS_LIB' \
         SHLIB_LINK='-lsybdb -L/usr/lib64' \
-            make && \
-        PG_CPPFLAGS='-I/usr/include -DENABLE_SPATIAL_TYPES -DENABLE_TDS_LIB' \
+            make -j"$(nproc)" && \
+        PG_CPPFLAGS='-I/opt/postgres/include/server -I/usr/include -DENABLE_SPATIAL_TYPES -DENABLE_TDS_LIB' \
         SHLIB_LINK='-lsybdb -L/usr/lib64' \
             make install
 
