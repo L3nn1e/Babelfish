@@ -42,7 +42,7 @@ RUN wget -q https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}
     sh cmake-${CMAKE_VERSION}-linux-x86_64.sh --skip-license --prefix=/usr/local && \
     rm cmake-${CMAKE_VERSION}-linux-x86_64.sh
 
-# 4. Клонирование репозиториев (РАЗНЫЕ теги!)
+# 4. Клонирование репозиториев
 WORKDIR /build
 RUN git clone --depth 1 --branch ${PG_BABEL_TAG} https://github.com/babelfish-for-postgresql/postgresql_modified_for_babelfish.git && \
     git clone --depth 1 --branch ${EXT_BABEL_TAG} https://github.com/babelfish-for-postgresql/babelfish_extensions.git
@@ -57,17 +57,20 @@ RUN ./configure --prefix=/opt/postgres --with-libxml --with-uuid=e2fs --with-icu
     cp -v src/backend/utils/mb/Unicode/*.map /opt/postgres/include/server/src/backend/utils/mb/Unicode/ && \
     cd contrib && make -j"$(nproc)" && make install
 
-# 6. Сборка PostGIS (ИСПРАВЛЕНО: явный PATH и абсолютный путь к pg_config)
+# Глобально добавляем pg_config в PATH и задаем переменную для всех последующих шагов
+ENV PATH="/opt/postgres/bin:${PATH}"
+ENV PG_CONFIG=/opt/postgres/bin/pg_config
+
+# 6. Сборка PostGIS
 WORKDIR /build
-RUN export PATH=/opt/postgres/bin:$PATH && \
-    wget -q https://download.osgeo.org/postgis/source/postgis-${POSTGIS_VERSION}.tar.gz && \
+RUN wget -q https://download.osgeo.org/postgis/source/postgis-${POSTGIS_VERSION}.tar.gz && \
     tar -xzf postgis-${POSTGIS_VERSION}.tar.gz && \
     cd postgis-${POSTGIS_VERSION} && \
     ./configure --with-pgconfig=/opt/postgres/bin/pg_config && \
     make -j"$(nproc)" && make install && \
     cd .. && rm -rf postgis-${POSTGIS_VERSION} postgis-${POSTGIS_VERSION}.tar.gz
 
-# 7. СБОРКА ANTLR C++ RUNTIME (через GitHub для защиты от 404)
+# 7. СБОРКА ANTLR C++ RUNTIME (через GitHub)
 WORKDIR /build
 RUN cp /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr/thirdparty/antlr/antlr-${ANTLR_VERSION}-complete.jar /usr/local/lib/ && \
     wget -q https://github.com/antlr/antlr4/archive/refs/tags/${ANTLR_VERSION}.zip -O antlr4-source.zip && \
@@ -84,7 +87,6 @@ RUN cd /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr && \
     make -j"$(nproc)"
 
 # 9. ПОДГОТОВКА К СБОРКЕ: Создаём симлинк /src и копируем расширения
-# КРИТИЧНО: Makefile расширения ищет скрипт по абсолютному пути /src/tools/...
 RUN ln -sfn /build/postgresql_modified_for_babelfish/src /src
 
 WORKDIR /build/postgresql_modified_for_babelfish/contrib
@@ -93,22 +95,24 @@ RUN cp -r /build/babelfish_extensions/contrib/babelfishpg_money . && \
     cp -r /build/babelfish_extensions/contrib/babelfishpg_tds . && \
     cp -r /build/babelfish_extensions/contrib/babelfishpg_tsql .
 
-# 10. СБОРКА РАСШИРЕНИЙ BABELEFISH
+# 10. СБОРКА РАСШИРЕНИЙ BABELEFISH (КРИТИЧНО: явная передача PG_CONFIG в make)
 WORKDIR /build/postgresql_modified_for_babelfish/contrib/babelfishpg_money
-RUN make && make install
+RUN make PG_CONFIG=/opt/postgres/bin/pg_config && make PG_CONFIG=/opt/postgres/bin/pg_config install
 
 WORKDIR /build/postgresql_modified_for_babelfish/contrib/babelfishpg_common
-RUN PG_CPPFLAGS='-I/usr/include -DENABLE_SPATIAL_TYPES' make && \
-    PG_CPPFLAGS='-I/usr/include -DENABLE_SPATIAL_TYPES' make install
+RUN PG_CPPFLAGS='-I/usr/include -DENABLE_SPATIAL_TYPES' make PG_CONFIG=/opt/postgres/bin/pg_config && \
+    PG_CPPFLAGS='-I/usr/include -DENABLE_SPATIAL_TYPES' make PG_CONFIG=/opt/postgres/bin/pg_config install
 
 WORKDIR /build/postgresql_modified_for_babelfish/contrib/babelfishpg_tds
-RUN make && make install
+RUN make PG_CONFIG=/opt/postgres/bin/pg_config && make PG_CONFIG=/opt/postgres/bin/pg_config install
 
 WORKDIR /build/postgresql_modified_for_babelfish/contrib/babelfishpg_tsql
 RUN PG_CPPFLAGS='-I/usr/include -I/usr/local/include -I/usr/local/include/antlr4-runtime -DENABLE_SPATIAL_TYPES -DENABLE_TDS_LIB' \
-    SHLIB_LINK='-lsybdb -L/usr/lib64 -L/usr/local/lib -lantlr4-runtime' make && \
+    SHLIB_LINK='-lsybdb -L/usr/lib64 -L/usr/local/lib -lantlr4-runtime' \
+    make PG_CONFIG=/opt/postgres/bin/pg_config && \
     PG_CPPFLAGS='-I/usr/include -I/usr/local/include -I/usr/local/include/antlr4-runtime -DENABLE_SPATIAL_TYPES -DENABLE_TDS_LIB' \
-    SHLIB_LINK='-lsybdb -L/usr/lib64 -L/usr/local/lib -lantlr4-runtime' make install
+    SHLIB_LINK='-lsybdb -L/usr/lib64 -L/usr/local/lib -lantlr4-runtime' \
+    make PG_CONFIG=/opt/postgres/bin/pg_config install
 
 ########################################
 # Этап 2: runtime
