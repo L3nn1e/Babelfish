@@ -32,7 +32,7 @@ RUN dnf install -y epel-release && \
     dnf clean all && \
     rm -rf /var/cache/dnf
 
-# 2. Java 17 (критично для ANTLR 4.13+)
+# 2. Java 17
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
@@ -44,7 +44,7 @@ RUN wget -q https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}
 
 ENV PATH="/usr/local/bin:${PATH}"
 
-# 4. Клонирование репозиториев (РАЗНЫЕ теги!)
+# 4. Клонирование репозиториев
 WORKDIR /build
 RUN git clone --depth 1 --branch ${PG_BABEL_TAG} \
         https://github.com/babelfish-for-postgresql/postgresql_modified_for_babelfish.git && \
@@ -58,7 +58,6 @@ RUN ./configure --prefix=/opt/postgres \
         --with-gssapi --disable-werror && \
     make -j"$(nproc)" && \
     make install && \
-    # КРИТИЧНО: Копируем сгенерированные .map файлы для расширений Babelfish
     mkdir -p /opt/postgres/include/server/src/backend/utils/mb/Unicode && \
     cp -v src/backend/utils/mb/Unicode/*.map \
        /opt/postgres/include/server/src/backend/utils/mb/Unicode/ && \
@@ -75,7 +74,7 @@ RUN wget -q https://download.osgeo.org/postgis/source/postgis-${POSTGIS_VERSION}
     make -j"$(nproc)" && make install && \
     cd .. && rm -rf postgis-${POSTGIS_VERSION} postgis-${POSTGIS_VERSION}.tar.gz
 
-# 7. СБОРКА ANTLR C++ RUNTIME (ИСПРАВЛЕНО: универсальный поиск и копирование)
+# 7. СБОРКА ANTLR C++ RUNTIME
 WORKDIR /build
 RUN cp /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr/thirdparty/antlr/antlr-${ANTLR_VERSION}-complete.jar \
         /usr/local/lib/ && \
@@ -88,11 +87,22 @@ RUN cp /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr/thirdparty/ant
         -DWITH_DEMO=False \
         -DBUILD_SHARED_LIBS=ON && \
     make -j"$(nproc)" && make install && \
-    # ИСПРАВЛЕНИЕ: Копируем из lib ИЛИ lib64, используя шаблон, чтобы не зависеть от точного имени файла
     find /usr/local/lib /usr/local/lib64 -maxdepth 1 -name "libantlr4-runtime.so*" -exec cp {} /opt/postgres/lib/ \; && \
     ldconfig
 
-# 8. Сборка расширений Babelfish
+# 8. ЯВНАЯ СБОРКА ANTLR-ПАРСЕРА ДЛЯ babelfishpg_tsql
+# Это критично: Makefile расширения использует переменные CMAKE и ANTLR_JAR_LOCATION
+WORKDIR /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr
+ENV CMAKE=/usr/local/bin/cmake
+ENV ANTLR_JAR_LOCATION=/usr/local/lib/antlr-${ANTLR_VERSION}-complete.jar
+RUN ${CMAKE} \
+        -DANTLR_JAR_LOCATION=${ANTLR_JAR_LOCATION} \
+        -DCMAKE_PREFIX_PATH=/usr/local \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        . && \
+    make -j"$(nproc)"
+
+# 9. Сборка расширений Babelfish (теперь ANTLR уже собран, и Makefile пропустит этот шаг)
 WORKDIR /build/babelfish_extensions/contrib
 RUN cd babelfishpg_money && make -j"$(nproc)" && make install && cd .. && \
     cd babelfishpg_common && \
