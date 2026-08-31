@@ -6,16 +6,21 @@
 FROM almalinux:9 AS builder
 
 ARG PG_BABEL_TAG=BABEL_5_4_0__PG_17_7
+# EXT_BABEL_TAG подтверждён через git ls-remote (тег BABEL_5_4_0 существует в
+# babelfish_extensions) — но при смене версии Babelfish снова проверяйте оба
+# тега отдельно, т.к. postgresql_modified_for_babelfish и babelfish_extensions
+# используют РАЗНЫЕ схемы версионирования и не обязаны совпадать.
 ARG EXT_BABEL_TAG=BABEL_5_4_0
 ARG ANTLR_VERSION=4.13.2
 ARG CMAKE_VERSION=3.28.3
 ARG POSTGIS_VERSION=3.5.1
 ARG TDS_FDW_VERSION=2.0.4
 
-# 1. Установка зависимостей
-RUN dnf install -y epel-release && \
+RUN dnf update -y && \
+    dnf groupinstall -y "Development Tools" && \
+    dnf install -y epel-release && \
     dnf config-manager --set-enabled crb && \
-    dnf install -y \
+    dnf install -y --setopt=install_weak_deps=False \
         gcc gcc-c++ make flex bison \
         libicu-devel libxml2-devel openssl-devel \
         libuuid-devel readline-devel zlib-devel \
@@ -32,35 +37,65 @@ RUN dnf install -y epel-release && \
     dnf clean all && \
     rm -rf /var/cache/dnf
 
-# 2. Java 17 для ANTLR
+# Примечание: в EL9 репозиторий с доп. пакетами тоже называется "crb" (CodeReady
+# Builder), как и в EL10. ossp-uuid в стандартных репах/EPEL9 по-прежнему нет,
+# поэтому используем --with-uuid=e2fs ниже — это официально поддерживаемая
+# опция PostgreSQL, а не хак под конкретную ОС. geos/proj/gdal — зависимости
+# PostGIS. freetds-devel — зависимость tds_fdw (linked servers). Широкий набор
+# perl-* пакетов (включая метапакет perl-core, реально существующий в EL9) —
+# подстраховка от "Can't locate X.pm": PostgreSQL 17 генерирует часть заголовков
+# каталога (gen_node_support.pl, genbki.pl) Perl-скриптами прямо во время сборки,
+# а perl-devel даёт только заголовки для XS, не core-модули.
+# --setopt=install_weak_deps=False — в EL9 dnf по умолчанию тянет Recommends
+# (в отличие от Ubuntu apt без --no-install-recommends, на которой тестирует
+# сам проект) — некоторые EPEL-пакеты через weak-зависимости способны незаметно
+# подтянуть лишний/конфликтующий софт.
+
+# Java 17 явно приоритетным в PATH — нужна конкретно для запуска ANTLR jar
+# (генерация парсера T-SQL). Явный ENV JAVA_HOME/PATH гарантирует, что везде
+# ниже вызывается именно эта JVM, а не что-то ещё, что могло установиться
+# как побочная зависимость другого пакета.
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk
 ENV PATH="/usr/local/bin:${JAVA_HOME}/bin:${PATH}"
 
-# 3. Установка cmake
+# cmake (нужна версия 3.20+, в репах может быть старее)
 WORKDIR /opt
 RUN wget -q https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.sh && \
     sh cmake-${CMAKE_VERSION}-linux-x86_64.sh --skip-license --prefix=/usr/local && \
     rm cmake-${CMAKE_VERSION}-linux-x86_64.sh
 
-# 4. Клонирование репозиториев
+# Исходники. ВАЖНО: перед сборкой проверьте точный тег babelfish_extensions
+# командой (на хосте, не в контейнере):
+#   git ls-remote --tags https://github.com/babelfish-for-postgresql/babelfish_extensions.git | grep -i "5_4_0"
+# и передайте его через --build-arg EXT_BABEL_TAG=..., если он отличается
+# от значения по умолчанию ниже — единый тег для обоих репозиториев не
+# гарантированно существует одновременно в обоих.
 WORKDIR /build
-RUN git clone --depth 1 --branch ${PG_BABEL_TAG} https://github.com/babelfish-for-postgresql/postgresql_modified_for_babelfish.git && \
-    git clone --depth 1 --branch ${EXT_BABEL_TAG} https://github.com/babelfish-for-postgresql/babelfish_extensions.git
+RUN git clone --depth 1 --branch ${PG_BABEL_TAG} \
+        https://github.com/babelfish-for-postgresql/postgresql_modified_for_babelfish.git && \
+    git clone --depth 1 --branch ${EXT_BABEL_TAG} \
+        https://github.com/babelfish-for-postgresql/babelfish_extensions.git
 
-# 5. Сборка PostgreSQL + хирургическое копирование заголовков
+# Сборка движка PostgreSQL, модифицированного для Babelfish. "Хирургическое"
+# копирование пары заголовков backend'а поверх make install — доп. страховка
+# на случай, если что-то всё же соберётся не in-tree (см. пояснение выше);
+# при in-tree сборке эти файлы и так на своих местах, но лишним не будет.
 WORKDIR /build/postgresql_modified_for_babelfish
-RUN ./configure --prefix=/opt/postgres --with-libxml --with-uuid=e2fs --with-icu --with-openssl --with-gssapi --disable-werror && \
+RUN ./configure --prefix=/opt/postgres \
+        --with-libxml --with-uuid=e2fs --with-icu --with-openssl \
+        --with-gssapi --disable-werror && \
     make -j"$(nproc)" && make install && \
     mkdir -p /opt/postgres/include/server/src/include/lib && \
     cp src/include/lib/qunique.h /opt/postgres/include/server/src/include/lib/ && \
     mkdir -p /opt/postgres/include/server/src/backend/utils/mb/Unicode && \
-    cp -v src/backend/utils/mb/Unicode/*.map /opt/postgres/include/server/src/backend/utils/mb/Unicode/ && \
+    cp -v src/backend/utils/mb/Unicode/*.map \
+       /opt/postgres/include/server/src/backend/utils/mb/Unicode/ && \
     cd contrib && make -j"$(nproc)" && make install
 
 ENV PATH="/opt/postgres/bin:${PATH}"
 ENV PG_CONFIG=/opt/postgres/bin/pg_config
 
-# 6. Сборка PostGIS
+# PostGIS — собирается через PGXS против нашего движка (не системного postgres)
 WORKDIR /build
 RUN wget -q https://download.osgeo.org/postgis/source/postgis-${POSTGIS_VERSION}.tar.gz && \
     tar -xzf postgis-${POSTGIS_VERSION}.tar.gz && \
@@ -69,64 +104,121 @@ RUN wget -q https://download.osgeo.org/postgis/source/postgis-${POSTGIS_VERSION}
     make -j"$(nproc)" && make install && \
     cd .. && rm -rf postgis-${POSTGIS_VERSION} postgis-${POSTGIS_VERSION}.tar.gz
 
-# 7. СБОРКА ANTLR C++ RUNTIME (через GitHub)
+# tds_fdw — foreign data wrapper для linked servers (доступ из Babelfish к
+# другим SQL Server/Babelfish инстансам по TDS). Не завязан на in-tree паттерн
+# ниже — обычное независимое PGXS-расширение, собирается против нашего движка.
 WORKDIR /build
-RUN cp /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr/thirdparty/antlr/antlr-${ANTLR_VERSION}-complete.jar /usr/local/lib/ && \
+RUN git clone --depth 1 --branch v${TDS_FDW_VERSION} \
+        https://github.com/tds-fdw/tds_fdw.git && \
+    cd tds_fdw && \
+    make USE_PGXS=1 PG_CONFIG=/opt/postgres/bin/pg_config -j"$(nproc)" && \
+    make USE_PGXS=1 PG_CONFIG=/opt/postgres/bin/pg_config install && \
+    cd .. && rm -rf tds_fdw
+
+# ANTLR C++ runtime — качаем архив исходников с GitHub Releases, а не с
+# antlr.org (тот отдаёт по HTTP без TLS и исторически менее стабилен). Ищем
+# собранную .so и в lib, и в lib64 — CMake на RHEL-семействе по умолчанию
+# кладёт библиотеки в lib64, в отличие от Debian/Ubuntu.
+WORKDIR /build
+RUN cp /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr/thirdparty/antlr/antlr-${ANTLR_VERSION}-complete.jar \
+        /usr/local/lib/ && \
     wget -q https://github.com/antlr/antlr4/archive/refs/tags/${ANTLR_VERSION}.zip -O antlr4-source.zip && \
     unzip -q -d antlr4 antlr4-source.zip && \
     cd antlr4/antlr4-${ANTLR_VERSION}/runtime/Cpp && mkdir build && cd build && \
-    /usr/local/bin/cmake .. -DANTLR_JAR_LOCATION=/usr/local/lib/antlr-${ANTLR_VERSION}-complete.jar -DCMAKE_INSTALL_PREFIX=/usr/local -DWITH_DEMO=False -DBUILD_SHARED_LIBS=ON && \
+    /usr/local/bin/cmake .. \
+        -DANTLR_JAR_LOCATION=/usr/local/lib/antlr-${ANTLR_VERSION}-complete.jar \
+        -DCMAKE_INSTALL_PREFIX=/usr/local -DWITH_DEMO=False -DBUILD_SHARED_LIBS=ON && \
     make -j"$(nproc)" && make install && \
-    find /usr/local/lib /usr/local/lib64 -maxdepth 1 -name "libantlr4-runtime.so*" -exec cp {} /opt/postgres/lib/ \; && \
+    find /usr/local/lib /usr/local/lib64 -maxdepth 1 -name "libantlr4-runtime.so*" \
+        -exec cp {} /opt/postgres/lib/ \; && \
     ldconfig
 
-# 8. ПОДГОТОВКА К СБОРКЕ: Создаём симлинк /src и копируем расширения
+# Симлинк /src — часть сборочных скриптов Babelfish ссылается на этот
+# абсолютный путь (унаследовано из их собственного CI/Docker-окружения).
 RUN ln -sfn /build/postgresql_modified_for_babelfish/src /src
 
+# Копируем исходники расширений Babelfish IN-TREE — см. пояснение в начале
+# раздела про то, почему это необходимо именно для этих четырёх расширений.
 WORKDIR /build/postgresql_modified_for_babelfish/contrib
 RUN cp -r /build/babelfish_extensions/contrib/babelfishpg_money . && \
     cp -r /build/babelfish_extensions/contrib/babelfishpg_common . && \
     cp -r /build/babelfish_extensions/contrib/babelfishpg_tds . && \
     cp -r /build/babelfish_extensions/contrib/babelfishpg_tsql .
 
-# 9. ГЕНЕРАЦИЯ MAKEFILE ДЛЯ ANTLR В IN-TREE ДИРЕКТОРИИ (КРИТИЧНО!)
-# После копирования расширений нужно сгенерировать Makefile для ANTLR в новой директории
+# Генерация Makefile для ANTLR уже в in-tree копии (не в исходном каталоге
+# babelfish_extensions) — -DJava_JAVA_EXECUTABLE указан явно, в обход PATH,
+# как дополнительная страховка поверх ENV JAVA_HOME/PATH выше.
 RUN cd /build/postgresql_modified_for_babelfish/contrib/babelfishpg_tsql/antlr && \
-    /usr/local/bin/cmake . -DANTLR_JAR_LOCATION=/usr/local/lib/antlr-${ANTLR_VERSION}-complete.jar -DJava_JAVA_EXECUTABLE=/usr/lib/jvm/java-17-openjdk/bin/java -DCMAKE_PREFIX_PATH=/usr/local -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=ON && \
+    /usr/local/bin/cmake . \
+        -DANTLR_JAR_LOCATION=/usr/local/lib/antlr-${ANTLR_VERSION}-complete.jar \
+        -DJava_JAVA_EXECUTABLE=/usr/lib/jvm/java-17-openjdk/bin/java \
+        -DCMAKE_PREFIX_PATH=/usr/local -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DBUILD_SHARED_LIBS=ON && \
     make -j"$(nproc)"
 
-# 10. СБОРКА РАСШИРЕНИЙ BABELEFISH
+# Сборка расширений Babelfish. babelfishpg_common и babelfishpg_tsql собираются
+# с -DENABLE_SPATIAL_TYPES (geometry/geography через PostGIS) и, для tsql,
+# дополнительно с -DENABLE_TDS_LIB (поддержка linked servers через tds_fdw).
+# PG_CONFIG передаётся явным аргументом make на каждый вызов — не полагаемся
+# только на ENV, чтобы точно не промахнуться мимо нашего движка.
 WORKDIR /build/postgresql_modified_for_babelfish/contrib/babelfishpg_money
-RUN make PG_CONFIG=/opt/postgres/bin/pg_config && make PG_CONFIG=/opt/postgres/bin/pg_config install
+RUN make PG_CONFIG=/opt/postgres/bin/pg_config && \
+    make PG_CONFIG=/opt/postgres/bin/pg_config install
 
 WORKDIR /build/postgresql_modified_for_babelfish/contrib/babelfishpg_common
-RUN PG_CPPFLAGS='-I/usr/include -DENABLE_SPATIAL_TYPES' make PG_CONFIG=/opt/postgres/bin/pg_config && \
-    PG_CPPFLAGS='-I/usr/include -DENABLE_SPATIAL_TYPES' make PG_CONFIG=/opt/postgres/bin/pg_config install
+RUN PG_CPPFLAGS='-I/usr/include -DENABLE_SPATIAL_TYPES' \
+        make PG_CONFIG=/opt/postgres/bin/pg_config && \
+    PG_CPPFLAGS='-I/usr/include -DENABLE_SPATIAL_TYPES' \
+        make PG_CONFIG=/opt/postgres/bin/pg_config install
 
 WORKDIR /build/postgresql_modified_for_babelfish/contrib/babelfishpg_tds
-RUN make PG_CONFIG=/opt/postgres/bin/pg_config && make PG_CONFIG=/opt/postgres/bin/pg_config install
+RUN make PG_CONFIG=/opt/postgres/bin/pg_config && \
+    make PG_CONFIG=/opt/postgres/bin/pg_config install
 
 WORKDIR /build/postgresql_modified_for_babelfish/contrib/babelfishpg_tsql
 RUN PG_CPPFLAGS='-I/usr/include -I/usr/local/include -I/usr/local/include/antlr4-runtime -DENABLE_SPATIAL_TYPES -DENABLE_TDS_LIB' \
-    SHLIB_LINK='-lsybdb -L/usr/lib64 -L/usr/local/lib -lantlr4-runtime' \
-    make PG_CONFIG=/opt/postgres/bin/pg_config && \
+        SHLIB_LINK='-lsybdb -L/usr/lib64 -L/usr/local/lib -lantlr4-runtime' \
+        make PG_CONFIG=/opt/postgres/bin/pg_config && \
     PG_CPPFLAGS='-I/usr/include -I/usr/local/include -I/usr/local/include/antlr4-runtime -DENABLE_SPATIAL_TYPES -DENABLE_TDS_LIB' \
-    SHLIB_LINK='-lsybdb -L/usr/lib64 -L/usr/local/lib -lantlr4-runtime' \
-    make PG_CONFIG=/opt/postgres/bin/pg_config install
+        SHLIB_LINK='-lsybdb -L/usr/lib64 -L/usr/local/lib -lantlr4-runtime' \
+        make PG_CONFIG=/opt/postgres/bin/pg_config install
 
 ########################################
-# Этап 2: runtime
+# Этап 2: runtime (та же версия базы, что и builder — важно для ABI-совместимости)
 ########################################
 FROM almalinux:9 AS runtime
 
-RUN dnf install -y epel-release && \
+RUN dnf update -y && \
+    dnf install -y epel-release && \
     dnf config-manager --set-enabled crb && \
     dnf install -y \
         libicu libxml2 openssl libuuid krb5-libs \
+        readline zlib \
         geos proj gdal json-c protobuf-c sqlite-libs \
-        freetds glibc-langpack-en shadow-utils && \
-    dnf clean all && rm -rf /var/cache/dnf
+        freetds \
+        glibc-langpack-en \
+        shadow-utils && \
+    dnf clean all && \
+    rm -rf /var/cache/dnf
 
+# readline/zlib здесь обязательны: builder не передаёт --without-readline
+# --without-zlib в ./configure, и раз readline-devel/zlib-devel присутствуют
+# в builder, PostgreSQL сам включит их поддержку — psql/pg_dump в итоге
+# слинкованы против libreadline.so/libz.so. Без этих пакетов здесь получите
+# "error while loading shared libraries" при первом же запуске psql.
+
+# Явная генерация локали поверх пакета glibc-langpack-en — защита на случай,
+# если RPM-триггер генерации локали почему-то не сработал в минимальном образе.
+RUN localedef -c -f UTF-8 -i en_US en_US.UTF-8 || true
+
+# Пользователь без прав root для запуска postgres
+# UID/GID 26 — исторически закреплены за postgres в Fedora/RHEL/AlmaLinux
+# (пакет postgresql-server), в отличие от Debian/Ubuntu, где принято 999/70.
+# Раз вся база — EL-семейство, используем нативную нумерацию. В минимальном
+# almalinux:9 сам пакет postgresql-server не установлен, поэтому UID 26 в
+# /etc/passwd ещё не занят — но зарезервирован пакетом setup, так что useradd
+# отработает без конфликтов. home-dir — отдельно от PGDATA, чисто для
+# shell/профиля пользователя, соответствует конвенции пакета postgresql-server.
 RUN groupadd -r postgres --gid=26 && \
     useradd -r -g postgres --uid=26 --home-dir=/var/lib/pgsql --shell=/bin/bash postgres && \
     mkdir -p /var/storage/pgsql/data && \
@@ -144,8 +236,12 @@ COPY healthcheck.sh /usr/local/bin/healthcheck.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/healthcheck.sh
 
 VOLUME ["/var/storage/pgsql/data"]
+
 EXPOSE 5432 1433
 
+# Встроенный healthcheck на уровне самого образа — работает даже если контейнер
+# запущен не через Quadlet (например, при разовом podman run в ходе отладки).
+# Логика вынесена в отдельный скрипт (раздел 8) — читаемее, чем длинный inline CMD.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD /usr/local/bin/healthcheck.sh
 
