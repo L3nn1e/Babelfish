@@ -42,7 +42,7 @@ RUN wget -q https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}
     sh cmake-${CMAKE_VERSION}-linux-x86_64.sh --skip-license --prefix=/usr/local && \
     rm cmake-${CMAKE_VERSION}-linux-x86_64.sh
 
-# 4. Клонирование репозиториев (РАЗНЫЕ теги!)
+# 4. Клонирование репозиториев
 WORKDIR /build
 RUN git clone --depth 1 --branch ${PG_BABEL_TAG} https://github.com/babelfish-for-postgresql/postgresql_modified_for_babelfish.git && \
     git clone --depth 1 --branch ${EXT_BABEL_TAG} https://github.com/babelfish-for-postgresql/babelfish_extensions.git
@@ -69,7 +69,7 @@ RUN wget -q https://download.osgeo.org/postgis/source/postgis-${POSTGIS_VERSION}
     make -j"$(nproc)" && make install && \
     cd .. && rm -rf postgis-${POSTGIS_VERSION} postgis-${POSTGIS_VERSION}.tar.gz
 
-# 7. Сборка tds_fdw (для Linked Servers)
+# 7. Сборка tds_fdw
 WORKDIR /build
 RUN git clone --depth 1 --branch v${TDS_FDW_VERSION} https://github.com/tds-fdw/tds_fdw.git && \
     cd tds_fdw && \
@@ -77,7 +77,7 @@ RUN git clone --depth 1 --branch v${TDS_FDW_VERSION} https://github.com/tds-fdw/
     make USE_PGXS=1 PG_CONFIG=/opt/postgres/bin/pg_config install && \
     cd .. && rm -rf tds_fdw
 
-# 8. СБОРКА ANTLR C++ RUNTIME (через GitHub)
+# 8. СБОРКА ANTLR C++ RUNTIME
 WORKDIR /build
 RUN cp /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr/thirdparty/antlr/antlr-${ANTLR_VERSION}-complete.jar /usr/local/lib/ && \
     wget -q https://github.com/antlr/antlr4/archive/refs/tags/${ANTLR_VERSION}.zip -O antlr4-source.zip && \
@@ -85,19 +85,17 @@ RUN cp /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr/thirdparty/ant
     cd antlr4/antlr4-${ANTLR_VERSION}/runtime/Cpp && mkdir build && cd build && \
     /usr/local/bin/cmake .. -DANTLR_JAR_LOCATION=/usr/local/lib/antlr-${ANTLR_VERSION}-complete.jar -DCMAKE_INSTALL_PREFIX=/usr/local -DWITH_DEMO=False -DBUILD_SHARED_LIBS=ON && \
     make -j"$(nproc)" && make install && \
-    find /usr/local/lib /usr/local/lib64 -maxdepth 1 -name "libantlr4-runtime.so*" -exec cp {} /opt/postgres/lib/ \; && \
-    ldconfig
+    find /usr/local/lib /usr/local/lib64 -maxdepth 1 -name "libantlr4-runtime.so*" -exec cp {} /opt/postgres/lib/ \;
 
-# 9. ПОДГОТОВКА К СБОРКЕ: Создаём симлинк /src и копируем расширения (in-tree)
+# 9. ПОДГОТОВКА К СБОРКЕ: in-tree
 RUN ln -sfn /build/postgresql_modified_for_babelfish/src /src
-
 WORKDIR /build/postgresql_modified_for_babelfish/contrib
 RUN cp -r /build/babelfish_extensions/contrib/babelfishpg_money . && \
     cp -r /build/babelfish_extensions/contrib/babelfishpg_common . && \
     cp -r /build/babelfish_extensions/contrib/babelfishpg_tds . && \
     cp -r /build/babelfish_extensions/contrib/babelfishpg_tsql .
 
-# 10. Генерация Makefile для ANTLR в in-tree директории
+# 10. Генерация Makefile для ANTLR
 RUN cd /build/postgresql_modified_for_babelfish/contrib/babelfishpg_tsql/antlr && \
     /usr/local/bin/cmake . -DANTLR_JAR_LOCATION=/usr/local/lib/antlr-${ANTLR_VERSION}-complete.jar -DJava_JAVA_EXECUTABLE=/usr/lib/jvm/java-17-openjdk/bin/java -DCMAKE_PREFIX_PATH=/usr/local -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=ON && \
     make -j"$(nproc)"
@@ -126,16 +124,33 @@ RUN PG_CPPFLAGS='-I/usr/include -I/usr/local/include -I/usr/local/include/antlr4
 ########################################
 FROM almalinux:9 AS runtime
 
-# Runtime-зависимости
+# Runtime-зависимости (добавлен libstdc++)
 RUN dnf install -y epel-release && \
     dnf config-manager --set-enabled crb && \
     dnf install -y \
         libicu libxml2 openssl libuuid krb5-libs \
         geos proj gdal json-c protobuf-c sqlite-libs \
-        freetds glibc-langpack-en shadow-utils && \
+        freetds glibc-langpack-en shadow-utils \
+        libstdc++ && \
     dnf clean all && rm -rf /var/cache/dnf
 
-# Явная проверка локали с выводом сообщения
+# Создание пользователя и директорий
+RUN groupadd -r postgres --gid=26 && \
+    useradd -r -g postgres --uid=26 --home-dir=/var/lib/pgsql --shell=/bin/bash postgres && \
+    mkdir -p /var/storage/pgsql/data && \
+    chown -R postgres:postgres /var/storage/pgsql
+
+# КОПИРОВАНИЕ СОБРАННОГО ПОСТГРЕСА (ТЕПЕРЬ ПЕРЕД LDCONFIG!)
+COPY --from=builder /opt/postgres /opt/postgres
+
+# ИСПРАВЛЕНО: Обновляем кэш библиотек ПОСЛЕ копирования файлов!
+RUN ldconfig
+
+# ПРОВЕРКА: Если какой-то библиотеки не хватает, сборка упадет здесь, а не при запуске!
+RUN ldd /opt/postgres/lib/babelfishpg_tsql.so | grep "not found" && { echo "❌ Ошибка: не найдены библиотеки для babelfishpg_tsql.so"; exit 1; } || echo "✅ Библиотеки babelfishpg_tsql.so в порядке"
+RUN ldd /opt/postgres/lib/babelfishpg_tds.so | grep "not found" && { echo "❌ Ошибка: не найдены библиотеки для babelfishpg_tds.so"; exit 1; } || echo "✅ Библиотеки babelfishpg_tds.so в порядке"
+
+# Проверка локали
 RUN if locale -a | grep -q "en_US.utf8"; then \
         echo "✅ Locale en_US.UTF-8 is available"; \
     else \
@@ -143,14 +158,8 @@ RUN if locale -a | grep -q "en_US.utf8"; then \
         exit 1; \
     fi
 
-RUN groupadd -r postgres --gid=26 && \
-    useradd -r -g postgres --uid=26 --home-dir=/var/lib/pgsql --shell=/bin/bash postgres && \
-    mkdir -p /var/storage/pgsql/data && \
-    chown -R postgres:postgres /var/storage/pgsql
-
-COPY --from=builder /opt/postgres /opt/postgres
-
 ENV PATH="/opt/postgres/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/opt/postgres/lib:${LD_LIBRARY_PATH}"
 ENV PGDATA=/var/storage/pgsql/data
 ENV LANG=en_US.UTF-8
 ENV LC_ALL=en_US.UTF-8
