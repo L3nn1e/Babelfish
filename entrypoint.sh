@@ -70,4 +70,3 @@ else
 fi
 
 exec /opt/postgres/bin/postgres -D "$PGDATA"
-chmod +x /opt/babelfish-image/entrypoint.sh
