@@ -3,79 +3,64 @@ set -euo pipefail
 
 PGDATA="${PGDATA:-/var/storage/pgsql/data}"
 POSTGRES_PASSWORD="${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}"
-BABELFISH_USER="${BABELFISH_USER:-babelfish_user}"
+BABELFISH_USER="${BABELFISH_USER:-bb_admin}"
 BABELFISH_PASS="${BABELFISH_PASS:-$POSTGRES_PASSWORD}"
 BABELFISH_DB="${BABELFISH_DB:-babelfish_db}"
 BABELFISH_MIGRATION_MODE="${BABELFISH_MIGRATION_MODE:-single-db}"
-ENABLE_POSTGIS="${ENABLE_POSTGIS:-true}"
-ENABLE_TDS_FDW="${ENABLE_TDS_FDW:-true}"
 
 init_db() {
     echo "[entrypoint] Инициализация нового кластера в $PGDATA"
+    printf "%s" "$POSTGRES_PASSWORD" > /tmp/pgpass
+    chmod 600 /tmp/pgpass
+    
+    /opt/postgres/bin/initdb -D "$PGDATA" --username=postgres --pwfile=/tmp/pgpass --encoding=UTF8 --locale=en_US.UTF-8
+    rm -f /tmp/pgpass
 
-    # Пароль суперпользователя ставится сразу при initdb через --pwfile (файловый
-    # дескриптор процесса, не аргумент командной строки — не светится в ps/логах).
-    # Так пароль известен серверу с первого момента его существования — не нужно
-    # отдельно подключаться и делать ALTER USER до/после старта.
-    initdb -D "$PGDATA" --username=postgres --pwfile=<(echo "$POSTGRES_PASSWORD") \
-        --encoding=UTF8 --locale=en_US.UTF-8
-
+    # ВАЖНО: В shared_preload_libraries ТОЛЬКО babelfishpg_tds
+    # babelfishpg_tsql и babelfishpg_common устанавливаются через CREATE EXTENSION CASCADE
     {
         echo "listen_addresses = '*'"
-        echo "shared_preload_libraries = 'babelfishpg_tds, babelfishpg_tsql'"
+        echo "port = 5432"
+        echo "shared_preload_libraries = 'babelfishpg_tds'"
         echo "babelfishpg_tds.listen_addresses = '0.0.0.0'"
         echo "babelfishpg_tds.port = 1433"
+        echo "babelfishpg_tsql.migration_mode = '${BABELFISH_MIGRATION_MODE}'"
     } >> "$PGDATA/postgresql.conf"
 
     echo "host all all 0.0.0.0/0 scram-sha-256" >> "$PGDATA/pg_hba.conf"
 
-    pg_ctl -D "$PGDATA" -o "-c listen_addresses='localhost'" -w start || {
-        echo "[entrypoint] Не удалось запустить PostgreSQL"
-        exit 1
-    }
+    # Запускаем PostgreSQL для инициализации
+    /opt/postgres/bin/pg_ctl -D "$PGDATA" -o "-c listen_addresses='localhost'" -w start
 
-    # Пароль передаётся через psql-переменную (--set + :'pw'), а не подставляется
-    # напрямую в SQL-строку — иначе пароль с одинарной кавычкой сломает синтаксис
-    # или откроет SQL-инъекцию в собственном bootstrap-скрипте.
-    psql -v ON_ERROR_STOP=1 --username postgres --set pw="${BABELFISH_PASS}" <<-SQL
-        CREATE USER ${BABELFISH_USER} WITH CREATEDB CREATEROLE PASSWORD :'pw' INHERIT;
-        DROP DATABASE IF EXISTS ${BABELFISH_DB};
-        CREATE DATABASE ${BABELFISH_DB} OWNER ${BABELFISH_USER};
+    # Создаём пользователя и базу
+    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres --set pw="${BABELFISH_PASS}" --set db="${BABELFISH_DB}" --set usr="${BABELFISH_USER}" <<-SQL
+        CREATE USER :"usr" WITH CREATEDB CREATEROLE PASSWORD :'pw' INHERIT;
+        DROP DATABASE IF EXISTS :"db";
+        CREATE DATABASE :"db" OWNER :"usr";
 SQL
 
-    psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" <<-SQL
+    # Устанавливаем расширения через CASCADE
+    # babelfishpg_tsql подтянет babelfishpg_common автоматически
+    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" --set usr="${BABELFISH_USER}" <<-SQL
+        CREATE EXTENSION IF NOT EXISTS "babelfishpg_tsql" CASCADE;
         CREATE EXTENSION IF NOT EXISTS "babelfishpg_tds" CASCADE;
-        GRANT ALL ON SCHEMA sys TO ${BABELFISH_USER};
+        GRANT ALL ON SCHEMA sys TO :"usr";
 SQL
 
-    if [ "$ENABLE_POSTGIS" = "true" ]; then
-        echo "[entrypoint] Включаю PostGIS в ${BABELFISH_DB}"
-        psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" <<-SQL
-            CREATE EXTENSION IF NOT EXISTS postgis;
-SQL
-    fi
-
-    if [ "$ENABLE_TDS_FDW" = "true" ]; then
-        echo "[entrypoint] Включаю tds_fdw в ${BABELFISH_DB}"
-        psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" <<-SQL
-            CREATE EXTENSION IF NOT EXISTS tds_fdw;
-SQL
-    fi
-
-    psql -v ON_ERROR_STOP=1 --username postgres <<-SQL
-        ALTER SYSTEM SET babelfishpg_tsql.database_name = '${BABELFISH_DB}';
-        ALTER SYSTEM SET babelfishpg_tsql.migration_mode = '${BABELFISH_MIGRATION_MODE}';
+    # Настраиваем Babelfish
+    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres --set db="${BABELFISH_DB}" --set mode="${BABELFISH_MIGRATION_MODE}" <<-SQL
+        ALTER SYSTEM SET babelfishpg_tsql.database_name = :'db';
+        ALTER DATABASE :"db" SET babelfishpg_tsql.migration_mode = :'mode';
         SELECT pg_reload_conf();
 SQL
 
-    psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" <<-SQL
-        CALL SYS.INITIALIZE_BABELFISH('${BABELFISH_USER}');
+    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" --set usr="${BABELFISH_USER}" <<-SQL
+        CALL SYS.INITIALIZE_BABELFISH(:'usr');
 SQL
 
-    if pg_ctl -D "$PGDATA" status >/dev/null 2>&1; then
-        pg_ctl -D "$PGDATA" -m fast -w stop
-    fi
-    echo "[entrypoint] Инициализация завершена"
+    # Останавливаем PostgreSQL
+    /opt/postgres/bin/pg_ctl -D "$PGDATA" -m fast -w stop
+    echo "[entrypoint] Инициализация Babelfish завершена успешно"
 }
 
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
@@ -84,4 +69,5 @@ else
     echo "[entrypoint] Существующий кластер обнаружен в $PGDATA, инициализация пропущена"
 fi
 
-exec "$@" -D "$PGDATA"
+exec /opt/postgres/bin/postgres -D "$PGDATA"
+chmod +x /opt/babelfish-image/entrypoint.sh
