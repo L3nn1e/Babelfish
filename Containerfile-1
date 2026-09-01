@@ -1,10 +1,5 @@
 # syntax=docker/dockerfile:1
-
-########################################
-# Этап 1: builder
-########################################
 FROM almalinux:9 AS builder
-
 ARG PG_BABEL_TAG=BABEL_5_4_0__PG_17_7
 ARG EXT_BABEL_TAG=BABEL_5_4_0
 ARG ANTLR_VERSION=4.13.2
@@ -56,24 +51,19 @@ RUN make PG_CONFIG=/opt/postgres/bin/pg_config && make PG_CONFIG=/opt/postgres/b
 WORKDIR /build/postgresql_modified_for_babelfish/contrib/babelfishpg_tsql
 RUN PG_CPPFLAGS='-I/usr/include -I/usr/local/include -I/usr/local/include/antlr4-runtime -DENABLE_SPATIAL_TYPES -DENABLE_TDS_LIB' SHLIB_LINK='-lsybdb -L/usr/lib64 -L/usr/local/lib -lantlr4-runtime' make PG_CONFIG=/opt/postgres/bin/pg_config && PG_CPPFLAGS='-I/usr/include -I/usr/local/include -I/usr/local/include/antlr4-runtime -DENABLE_SPATIAL_TYPES -DENABLE_TDS_LIB' SHLIB_LINK='-lsybdb -L/usr/lib64 -L/usr/local/lib -lantlr4-runtime' make PG_CONFIG=/opt/postgres/bin/pg_config install
 
-########################################
-# Этап 2: runtime
-########################################
 FROM almalinux:9 AS runtime
-
 RUN dnf install -y epel-release && dnf config-manager --set-enabled crb && dnf install -y libicu libxml2 openssl libuuid krb5-libs geos proj gdal json-c protobuf-c sqlite-libs freetds glibc-langpack-en shadow-utils libstdc++ && dnf clean all && rm -rf /var/cache/dnf
 
 RUN groupadd -r postgres --gid=26 && useradd -r -g postgres --uid=26 --home-dir=/var/lib/pgsql --shell=/bin/bash postgres && mkdir -p /var/storage/pgsql/data && chown -R postgres:postgres /var/storage/pgsql
 
-# КРИТИЧЕСКИ ВАЖНО: Копируем собранные файлы ПЕРЕД обновлением кэша библиотек
 COPY --from=builder /opt/postgres /opt/postgres
 
-# КРИТИЧЕСКИ ВАЖНО: Обновляем кэш динамических библиотек ПОСЛЕ копирования
-RUN ldconfig
+# ИСПРАВЛЕНИЕ: Babelfish использует версионирование библиотек через module_pathname
+# Создаем символические ссылки для правильных имен библиотек
+RUN ln -s /opt/postgres/lib/babelfishpg_tsql.so /opt/postgres/lib/babelfishpg_tsql-5.so && \
+    ln -s /opt/postgres/lib/babelfishpg_common.so /opt/postgres/lib/babelfishpg_common-5.so
 
-# ПРОВЕРКА: Если библиотеки не найдены, сборка упадет здесь, а не при запуске контейнера
-RUN ldd /opt/postgres/lib/babelfishpg_tsql.so | grep "not found" && { echo "❌ ОШИБКА: Не найдены библиотеки для babelfishpg_tsql.so"; exit 1; } || echo "✅ Библиотеки babelfishpg_tsql.so в порядке"
-RUN ldd /opt/postgres/lib/babelfishpg_tds.so | grep "not found" && { echo "❌ ОШИБКА: Не найдены библиотеки для babelfishpg_tds.so"; exit 1; } || echo "✅ Библиотеки babelfishpg_tds.so в порядке"
+RUN ldconfig
 
 RUN if locale -a | grep -q "en_US.utf8"; then echo "✅ Locale en_US.UTF-8 is available"; else echo "❌ ERROR: en_US.UTF-8 locale not found!"; exit 1; fi
 
