@@ -126,17 +126,21 @@ RUN PG_CPPFLAGS='-I/usr/include -I/usr/local/include -I/usr/local/include/antlr4
 ########################################
 FROM almalinux:9 AS runtime
 
-# ИСПРАВЛЕНО: добавлен glibc-common для корректной работы localedef
+# Runtime-зависимости
+# glibc-langpack-en уже содержит готовую скомпилированную локаль en_US.UTF-8
+# в /usr/lib/locale/en_US.utf8/ — команда localedef НЕ нужна
 RUN dnf install -y epel-release && \
     dnf config-manager --set-enabled crb && \
     dnf install -y \
         libicu libxml2 openssl libuuid krb5-libs \
         geos proj gdal json-c protobuf-c sqlite-libs \
-        freetds glibc-langpack-en glibc-common shadow-utils && \
+        freetds glibc-langpack-en shadow-utils && \
     dnf clean all && rm -rf /var/cache/dnf
 
-# ИСПРАВЛЕНО: теперь localedef сработает без ошибок
-RUN localedef -c -i en_US -f UTF-8 en_US.UTF-8
+# УДАЛЕНО: RUN localedef -c -i en_US -f UTF-8 en_US.UTF-8
+# Пакет glibc-langpack-en уже устанавливает готовую локаль.
+# Добавляем проверку, что локаль действительно доступна:
+RUN locale -a | grep -q "en_US.utf8" || (echo "ERROR: en_US.UTF-8 locale not found!" && exit 1)
 
 RUN groupadd -r postgres --gid=26 && \
     useradd -r -g postgres --uid=26 --home-dir=/var/lib/pgsql --shell=/bin/bash postgres && \
