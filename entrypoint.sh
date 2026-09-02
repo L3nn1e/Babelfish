@@ -16,6 +16,7 @@ init_db() {
     /opt/postgres/bin/initdb -D "$PGDATA" --username=postgres --pwfile=/tmp/pgpass --encoding=UTF8 --locale=en_US.UTF-8
     rm -f /tmp/pgpass
 
+    # Конфигурация PostgreSQL — ВСЕ параметры ДО первого запуска
     {
         echo "listen_addresses = '*'"
         echo "port = 5432"
@@ -24,6 +25,7 @@ init_db() {
         echo "babelfishpg_tds.listen_addresses = '0.0.0.0'"
         echo "babelfishpg_tds.port = 1433"
         echo "babelfishpg_tsql.migration_mode = '${BABELFISH_MIGRATION_MODE}'"
+        echo "babelfishpg_tsql.database_name = '${BABELFISH_DB}'"
     } >> "$PGDATA/postgresql.conf"
 
     cat > "$PGDATA/pg_hba.conf" <<PGEOF
@@ -39,23 +41,39 @@ PGEOF
 
     /opt/postgres/bin/pg_ctl -D "$PGDATA" -o "-c listen_addresses='localhost'" -w start
 
-    # 1. Создание пользователя и базы
-    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres --set pw="${BABELFISH_PASS}" --set db="${BABELFISH_DB}" --set usr="${BABELFISH_USER}" <<-SQL
+    # 1. Создание пользователя и базы данных
+    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
+        --set pw="${BABELFISH_PASS}" --set db="${BABELFISH_DB}" --set usr="${BABELFISH_USER}" <<-SQL
         CREATE USER :"usr" WITH CREATEDB CREATEROLE PASSWORD :'pw' INHERIT;
         DROP DATABASE IF EXISTS :"db";
         CREATE DATABASE :"db" OWNER :"usr";
 SQL
 
-    # 2. Установка расширений
-    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" --set usr="${BABELFISH_USER}" <<-SQL
+    # 2. Установка расширений Babelfish
+    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
+        --dbname "${BABELFISH_DB}" --set usr="${BABELFISH_USER}" <<-SQL
         CREATE EXTENSION IF NOT EXISTS "babelfishpg_tsql" CASCADE;
         CREATE EXTENSION IF NOT EXISTS "babelfishpg_tds" CASCADE;
-        
-        -- Права на системную схему sys (обязательно для Babelfish)
+SQL
+
+    # 3. ВАЖНО: Права на схемы ДО инициализации Babelfish!
+    # Это позволяет INITIALIZE_BABELFISH создать все объекты от имени пользователя
+    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
+        --dbname "${BABELFISH_DB}" --set usr="${BABELFISH_USER}" <<-SQL
         GRANT ALL ON SCHEMA sys TO :"usr";
-        
-        -- Права на схему dbo (для пользовательских объектов в babelfish_db)
         GRANT ALL ON SCHEMA dbo TO :"usr";
+        GRANT ALL ON SCHEMA information_schema_tsql TO :"usr";
+SQL
+
+    # 4. Инициализация Babelfish — создаёт системные таблицы И регистрирует login
+    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
+        --dbname "${BABELFISH_DB}" --set usr="${BABELFISH_USER}" <<-SQL
+        CALL SYS.INITIALIZE_BABELFISH(:'usr');
+SQL
+
+    # 5. Дополнительные права ПОСЛЕ инициализации
+    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
+        --dbname "${BABELFISH_DB}" --set usr="${BABELFISH_USER}" <<-SQL
         GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA dbo TO :"usr";
         GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA dbo TO :"usr";
         GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA dbo TO :"usr";
@@ -64,20 +82,9 @@ SQL
         ALTER DEFAULT PRIVILEGES IN SCHEMA dbo GRANT ALL ON FUNCTIONS TO :"usr";
 SQL
 
-    # 3. Настройка Babelfish
-    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres --set db="${BABELFISH_DB}" --set mode="${BABELFISH_MIGRATION_MODE}" <<-SQL
-        ALTER SYSTEM SET babelfishpg_tsql.database_name = :'db';
-        ALTER DATABASE :"db" SET babelfishpg_tsql.migration_mode = :'mode';
-        SELECT pg_reload_conf();
-SQL
-
-    # 4. Инициализация Babelfish (создаёт T-SQL роли и назначает db_owner)
-    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" --set usr="${BABELFISH_USER}" <<-SQL
-        CALL SYS.INITIALIZE_BABELFISH(:'usr');
-SQL
-
-    # 5. Создание объектов-заглушек для совместимости с Azure Data Studio
-    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" <<-SQL
+    # 6. Создание объектов-заглушек для совместимости с Azure Data Studio / SSMS
+    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
+        --dbname "${BABELFISH_DB}" <<-SQL
         CREATE OR REPLACE VIEW sys.dm_os_windows_info AS
         SELECT 
             '10.0' AS windows_release,
@@ -109,3 +116,4 @@ else
 fi
 
 exec /opt/postgres/bin/postgres -D "$PGDATA"
+chmod +x /opt/babelfish-image/entrypoint.sh
