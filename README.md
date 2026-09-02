@@ -460,11 +460,12 @@ POSTGRES_PASSWORD="${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}"
 BABELFISH_USER="${BABELFISH_USER:-babelfish_user}"
 BABELFISH_PASS="${BABELFISH_PASS:-$POSTGRES_PASSWORD}"
 BABELFISH_DB="${BABELFISH_DB:-babelfish_db}"
-# Дефолт single-db — для консистентности с остальным гайдом (примеры, объяснения
-# multi-db/single-db выше построены вокруг single-db). В боевом Quadlet-юните
-# (раздел 12) значение всё равно всегда передаётся явно через Environment=,
-# так что этот дефолт актуален только при запуске образа без явной настройки.
-BABELFISH_MIGRATION_MODE="${BABELFISH_MIGRATION_MODE:-single-db}"
+# Дефолт multi-db — основной режим для продакшена в этом гайде: одна БД
+# Babelfish экспонирует несколько "логических" T-SQL баз одновременно
+# (каждая — комбинация схем в Postgres). В боевом Quadlet-юните (раздел 12)
+# значение всё равно всегда передаётся явно через Environment=, так что этот
+# дефолт актуален только при запуске образа без явной настройки.
+BABELFISH_MIGRATION_MODE="${BABELFISH_MIGRATION_MODE:-multi-db}"
 ENABLE_POSTGIS="${ENABLE_POSTGIS:-true}"
 ENABLE_TDS_FDW="${ENABLE_TDS_FDW:-true}"
 # Опционально: заглушки под GUI-клиенты (SSMS/Azure Data Studio) — см. пояснение
@@ -501,20 +502,15 @@ init_db() {
     # Полностью переопределяем pg_hba.conf, а не дописываем к дефолту от
     # initdb — так весь набор разрешённых подключений явный и предсказуемый,
     # а не зависит от того, что именно сгенерировал initdb по умолчанию.
-    cat > "$PGDATA/pg_hba.conf" <<-PGEOF
-        # Локальные подключения (PostgreSQL protocol, порт 5432)
-        local   all             all                                     trust
-        host    all             all             127.0.0.1/32            trust
-        host    all             all             ::1/128                 trust
-
-        # Репликация
-        local   replication     all                                     trust
-        host    replication     all             127.0.0.1/32            trust
-        host    replication     all             ::1/128                 trust
-
-        # Удалённые подключения через TDS (порт 1433) и обычный Postgres-протокол
-        host    all             all             0.0.0.0/0               md5
-        host    all             all             ::/0                    md5
+    cat > "$PGDATA/pg_hba.conf" <<PGEOF
+local   all             all                                     trust
+host    all             all             127.0.0.1/32            trust
+host    all             all             ::1/128                 trust
+local   replication     all                                     trust
+host    replication     all             127.0.0.1/32            trust
+host    replication     all             ::1/128                 trust
+host    all             all             0.0.0.0/0               md5
+host    all             all             ::/0                    md5
 PGEOF
 
     /opt/postgres/bin/pg_ctl -D "$PGDATA" -o "-c listen_addresses='localhost'" -w start || {
@@ -533,10 +529,26 @@ PGEOF
         CREATE DATABASE :"db" OWNER :"usr";
 SQL
 
+    # Оба расширения создаём явно, а не полагаемся на CASCADE от одного —
+    # неизвестно заранее, кто от кого зависит в графе (tsql тянет tds+common,
+    # или наоборот), безопаснее не гадать.
     /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" \
         --set usr="${BABELFISH_USER}" <<-SQL
+        CREATE EXTENSION IF NOT EXISTS "babelfishpg_tsql" CASCADE;
         CREATE EXTENSION IF NOT EXISTS "babelfishpg_tds" CASCADE;
+
+        -- sys — служебная схема Babelfish, обязательна.
         GRANT ALL ON SCHEMA sys TO :"usr";
+
+        -- dbo — схема по умолчанию для пользовательских T-SQL объектов;
+        -- владение базой само по себе не даёт прав на конкретную схему.
+        GRANT ALL ON SCHEMA dbo TO :"usr";
+        GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA dbo TO :"usr";
+        GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA dbo TO :"usr";
+        GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA dbo TO :"usr";
+        ALTER DEFAULT PRIVILEGES IN SCHEMA dbo GRANT ALL ON TABLES TO :"usr";
+        ALTER DEFAULT PRIVILEGES IN SCHEMA dbo GRANT ALL ON SEQUENCES TO :"usr";
+        ALTER DEFAULT PRIVILEGES IN SCHEMA dbo GRANT ALL ON FUNCTIONS TO :"usr";
 SQL
 
     if [ "$ENABLE_POSTGIS" = "true" ]; then
@@ -577,15 +589,27 @@ SQL
 
             CREATE OR REPLACE PROCEDURE dbo.xp_msver()
             LANGUAGE sql
-            AS \$\$
+            AS \$sql\$
                 SELECT 1, 'ProductName'::text, 0, 'Babelfish for PostgreSQL'::text
                 UNION ALL SELECT 2, 'ProductVersion', 0, '17.7.0'
                 UNION ALL SELECT 3, 'Language', 0, 'English (United States)'
                 UNION ALL SELECT 4, 'Platform', 0, 'Linux'
-            \$\$;
+            \$sql\$;
+
+            -- master_dbo — то же самое для вызовов master.dbo.xp_msver
+            -- (некоторые клиенты обращаются именно так, а не через dbo напрямую)
+            CREATE OR REPLACE PROCEDURE master_dbo.xp_msver()
+            LANGUAGE sql
+            AS \$sql\$
+                SELECT 1, 'ProductName'::text, 0, 'Babelfish for PostgreSQL'::text
+                UNION ALL SELECT 2, 'ProductVersion', 0, '17.7.0'
+                UNION ALL SELECT 3, 'Language', 0, 'English (United States)'
+                UNION ALL SELECT 4, 'Platform', 0, 'Linux'
+            \$sql\$;
 
             GRANT SELECT ON sys.dm_os_windows_info TO PUBLIC;
             GRANT EXECUTE ON PROCEDURE dbo.xp_msver() TO PUBLIC;
+            GRANT EXECUTE ON PROCEDURE master_dbo.xp_msver() TO PUBLIC;
 SQL
     fi
 
@@ -728,7 +752,7 @@ Volume=/var/storage/pgsql/data:/var/storage/pgsql/data:Z
 EnvironmentFile=/etc/babelfish/babelfish.env
 Environment=BABELFISH_USER=babelfish_user
 Environment=BABELFISH_DB=babelfish_db
-Environment=BABELFISH_MIGRATION_MODE=single-db
+Environment=BABELFISH_MIGRATION_MODE=multi-db
 # По желанию — выключить встроенные PostGIS/tds_fdw для конкретной базы:
 # Environment=ENABLE_POSTGIS=false
 # Environment=ENABLE_TDS_FDW=false
@@ -811,13 +835,15 @@ psql -U babelfish_user -d babelfish_db -c "\conninfo"
 psql -U babelfish_user -d babelfish_db -c "SHOW babelfishpg_tsql.migration_mode;"
 ```
 
-Если нужно донастроить вручную (например, добавить ещё одну "логическую" базу в multi-db режиме):
+Если нужно добавить ещё одну "логическую" базу (типично для `multi-db` — каждая T-SQL база в SQL Server соответствует отдельной Postgres-базе с собственным набором расширений и прав):
 
 ```sql
 CREATE DATABASE my_app_db;
 \c my_app_db
+CREATE EXTENSION IF NOT EXISTS "babelfishpg_tsql" CASCADE;
 CREATE EXTENSION IF NOT EXISTS "babelfishpg_tds" CASCADE;
 GRANT ALL ON SCHEMA sys TO babelfish_user;
+GRANT ALL ON SCHEMA dbo TO babelfish_user;
 ```
 
 Проверка подключения через FreeTDS (`tsql`, уже установлен в разделе 4):
