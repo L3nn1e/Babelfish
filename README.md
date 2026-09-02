@@ -289,8 +289,7 @@ RUN cp /build/babelfish_extensions/contrib/babelfishpg_tsql/antlr/thirdparty/ant
         -DCMAKE_INSTALL_PREFIX=/usr/local -DWITH_DEMO=False -DBUILD_SHARED_LIBS=ON && \
     make -j"$(nproc)" && make install && \
     find /usr/local/lib /usr/local/lib64 -maxdepth 1 -name "libantlr4-runtime.so*" \
-        -exec cp {} /opt/postgres/lib/ \; && \
-    ldconfig
+        -exec cp {} /opt/postgres/lib/ \;
 
 # Симлинк /src — часть сборочных скриптов Babelfish ссылается на этот
 # абсолютный путь (унаследовано из их собственного CI/Docker-окружения).
@@ -356,7 +355,8 @@ RUN dnf update -y && \
         geos proj gdal json-c protobuf-c sqlite-libs \
         freetds \
         glibc-langpack-en \
-        shadow-utils && \
+        shadow-utils \
+        libstdc++ && \
     dnf clean all && \
     rm -rf /var/cache/dnf
 
@@ -365,6 +365,8 @@ RUN dnf update -y && \
 # в builder, PostgreSQL сам включит их поддержку — psql/pg_dump в итоге
 # слинкованы против libreadline.so/libz.so. Без этих пакетов здесь получите
 # "error while loading shared libraries" при первом же запуске psql.
+# libstdc++ — ANTLR4 C++ runtime (и слинкованный с ним babelfishpg_tsql.so)
+# это C++-код, без libstdc++.so контейнер не запустится вообще.
 
 # Явная проверка локали вместо тихой попытки генерации — если glibc-langpack-en
 # по какой-то причине не сгенерировал локаль через свой RPM-триггер, сборка
@@ -379,25 +381,42 @@ RUN if locale -a | grep -q "en_US.utf8"; then \
         echo "ERROR: en_US.UTF-8 locale not found!" && exit 1; \
     fi
 
-# Пользователь без прав root для запуска postgres
+# Пользователь без прав root для запуска postgres, БЕЗ домашней директории —
+# для системного сервисного аккаунта она не нужна (не предназначен для
+# интерактивного логина); отсутствие $HOME компенсируется ниже через
+# ENV PSQL_HISTORY=/dev/null, чтобы psql не пытался писать историю команд
+# в несуществующий каталог.
 # UID/GID 26 — исторически закреплены за postgres в Fedora/RHEL/AlmaLinux
 # (пакет postgresql-server), в отличие от Debian/Ubuntu, где принято 999/70.
-# Раз вся база — EL-семейство, используем нативную нумерацию. В минимальном
-# almalinux:9 сам пакет postgresql-server не установлен, поэтому UID 26 в
-# /etc/passwd ещё не занят — но зарезервирован пакетом setup, так что useradd
-# отработает без конфликтов. home-dir — отдельно от PGDATA, чисто для
-# shell/профиля пользователя, соответствует конвенции пакета postgresql-server.
 RUN groupadd -r postgres --gid=26 && \
-    useradd -r -g postgres --uid=26 --home-dir=/var/lib/pgsql --shell=/bin/bash postgres && \
+    useradd -r -g postgres --uid=26 --shell=/bin/bash postgres && \
     mkdir -p /var/storage/pgsql/data && \
     chown -R postgres:postgres /var/storage/pgsql
 
 COPY --from=builder /opt/postgres /opt/postgres
 
+# Символические ссылки на версионированные имена библиотек. Babelfish
+# ссылается на некоторые свои .so через module_pathname с внутренним ABI-
+# суффиксом (не совпадающим с номером релиза), не всегда равным голому
+# имени файла из make install. Суффикс "-5" подобран под BABEL_5_4_0 —
+# при смене версии Babelfish перепроверьте актуальность этого номера
+# (например, по ошибке "could not access file ... babelfishpg_tsql-N"
+# при CREATE EXTENSION, если суффикс окажется не тем).
+RUN ln -s /opt/postgres/lib/babelfishpg_tsql.so /opt/postgres/lib/babelfishpg_tsql-5.so && \
+    ln -s /opt/postgres/lib/babelfishpg_common.so /opt/postgres/lib/babelfishpg_common-5.so
+
+# ldconfig — здесь, а не в builder-этапе: builder и runtime это два разных
+# FROM, кэш линковщика из builder не переживает переход между стадиями,
+# копируются только сами .so-файлы через COPY --from=builder. Обновлять
+# кэш нужно после того, как файлы физически оказались в этом слое.
+RUN ldconfig
+
 ENV PATH="/opt/postgres/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/opt/postgres/lib:${LD_LIBRARY_PATH}"
 ENV PGDATA=/var/storage/pgsql/data
 ENV LANG=en_US.UTF-8
 ENV LC_ALL=en_US.UTF-8
+ENV PSQL_HISTORY=/dev/null
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY healthcheck.sh /usr/local/bin/healthcheck.sh
@@ -415,7 +434,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
 
 USER postgres
 ENTRYPOINT ["entrypoint.sh"]
-CMD ["postgres"]
 ```
 
 Комментарии по ключевым решениям:
@@ -423,10 +441,11 @@ CMD ["postgres"]
 - `--with-gssapi` — включает поддержку Kerberos-аутентификации; `krb5-devel` уже стоит в builder-этапе, а `krb5-libs` — в runtime, отдельно ничего добавлять не нужно.
 - PostGIS и tds_fdw собираются через PGXS против нашего собственного движка (`--with-pgconfig`/`PG_CONFIG=/opt/postgres/bin/pg_config`), а не системного `postgres` — иначе расширения попадут не туда.
 - `-DENABLE_TDS_LIB` и `SHLIB_LINK='-lsybdb -L/usr/lib64 -L/usr/local/lib -lantlr4-runtime'` при сборке `babelfishpg_tsql` — обязательное условие для поддержки linked servers через tds_fdw и корректной линковки с ANTLR runtime; без первого флага расширение соберётся, но T-SQL код, обращающийся к linked server, будет падать с ошибкой.
-- Runtime-образ не содержит компиляторов и dev-заголовков (только рантайм-версии `geos`/`proj`/`gdal`/`freetds`/`readline`/`zlib` без `-devel`) — меньше размер и площадь атаки.
-- Контейнер работает от непривилегированного пользователя `postgres` (uid/gid 26 — стандарт для EL-дистрибутивов), с домашним каталогом `/var/lib/pgsql` (RHEL-конвенция) отдельно от `PGDATA=/var/storage/pgsql/data` — соответствует нумерации и структуре пакета `postgresql-server` в самом AlmaLinux.
+- Runtime-образ не содержит компиляторов и dev-заголовков (только рантайм-версии `geos`/`proj`/`gdal`/`freetds`/`readline`/`zlib`/`libstdc++` без `-devel`) — меньше размер и площадь атаки.
+- Контейнер работает от непривилегированного пользователя `postgres` (uid/gid 26 — стандарт для EL-дистрибутивов), без домашней директории (не нужна системному сервисному аккаунту) — `PSQL_HISTORY=/dev/null` компенсирует отсутствие `$HOME` для истории команд `psql`.
 - `glibc-langpack-en` в runtime и `ENV LANG=en_US.UTF-8`/`LC_ALL=en_US.UTF-8` — без этого пакета `initdb --locale=en_US.UTF-8` в `entrypoint.sh` (раздел 7) упадёт на минимальном образе, где эта локаль не сгенерирована.
 - `HEALTHCHECK` в самом образе — это дополнение, а не замена `HealthCmd=` в Quadlet-юните (раздел 12): Quadlet-версия управляется systemd и видна в `systemctl status`, встроенная в образ — работает независимо от способа запуска контейнера.
+- `CMD` больше нет — `entrypoint.sh` теперь сам явно вызывает `exec /opt/postgres/bin/postgres -D "$PGDATA"` в конце (раздел 7), а не полагается на `"$@"` из `CMD ["postgres"]`.
 
 ---
 
@@ -441,75 +460,136 @@ POSTGRES_PASSWORD="${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}"
 BABELFISH_USER="${BABELFISH_USER:-babelfish_user}"
 BABELFISH_PASS="${BABELFISH_PASS:-$POSTGRES_PASSWORD}"
 BABELFISH_DB="${BABELFISH_DB:-babelfish_db}"
+# Дефолт single-db — для консистентности с остальным гайдом (примеры, объяснения
+# multi-db/single-db выше построены вокруг single-db). В боевом Quadlet-юните
+# (раздел 12) значение всё равно всегда передаётся явно через Environment=,
+# так что этот дефолт актуален только при запуске образа без явной настройки.
 BABELFISH_MIGRATION_MODE="${BABELFISH_MIGRATION_MODE:-single-db}"
 ENABLE_POSTGIS="${ENABLE_POSTGIS:-true}"
 ENABLE_TDS_FDW="${ENABLE_TDS_FDW:-true}"
+# Опционально: заглушки под GUI-клиенты (SSMS/Azure Data Studio) — см. пояснение
+# после блока кода. Не официальная часть Babelfish, чисто quality-of-life.
+ENABLE_GUI_CLIENT_STUBS="${ENABLE_GUI_CLIENT_STUBS:-false}"
 
 init_db() {
     echo "[entrypoint] Инициализация нового кластера в $PGDATA"
 
-    # Пароль суперпользователя ставится сразу при initdb через --pwfile (файловый
-    # дескриптор процесса, не аргумент командной строки — не светится в ps/логах).
-    # Так пароль известен серверу с первого момента его существования — не нужно
-    # отдельно подключаться и делать ALTER USER до/после старта.
-    initdb -D "$PGDATA" --username=postgres --pwfile=<(echo "$POSTGRES_PASSWORD") \
+    # Пароль через временный файл вместо process substitution — эквивалентно
+    # по безопасности (не светится в аргументах команды/ps), но чуть надёжнее
+    # переносится между разными реализациями shell/initdb.
+    printf "%s" "$POSTGRES_PASSWORD" > /tmp/pgpass
+    chmod 600 /tmp/pgpass
+    /opt/postgres/bin/initdb -D "$PGDATA" --username=postgres --pwfile=/tmp/pgpass \
         --encoding=UTF8 --locale=en_US.UTF-8
+    rm -f /tmp/pgpass
 
     {
         echo "listen_addresses = '*'"
-        echo "shared_preload_libraries = 'babelfishpg_tds, babelfishpg_tsql'"
+        echo "port = 5432"
+        # ВАЖНО: TDS-протокол (используется SQL Server-клиентами — sqlcmd, tsql,
+        # SSMS) не поддерживает SCRAM-SHA-256 — это ограничение самого TDS
+        # wire-протокола, а не PostgreSQL. babelfishpg_tds для аутентификации
+        # клиентов, подключающихся по 1433, нуждается в md5 (или trust/gssapi).
+        # scram-sha-256 здесь означает, что аутентификация по TDS не будет
+        # работать вообще, даже если обычный psql по 5432 подключается нормально.
+        echo "password_encryption = 'md5'"
+        echo "shared_preload_libraries = 'babelfishpg_tds'"
         echo "babelfishpg_tds.listen_addresses = '0.0.0.0'"
         echo "babelfishpg_tds.port = 1433"
     } >> "$PGDATA/postgresql.conf"
 
-    echo "host all all 0.0.0.0/0 scram-sha-256" >> "$PGDATA/pg_hba.conf"
+    # Полностью переопределяем pg_hba.conf, а не дописываем к дефолту от
+    # initdb — так весь набор разрешённых подключений явный и предсказуемый,
+    # а не зависит от того, что именно сгенерировал initdb по умолчанию.
+    cat > "$PGDATA/pg_hba.conf" <<-PGEOF
+        # Локальные подключения (PostgreSQL protocol, порт 5432)
+        local   all             all                                     trust
+        host    all             all             127.0.0.1/32            trust
+        host    all             all             ::1/128                 trust
 
-    pg_ctl -D "$PGDATA" -o "-c listen_addresses='localhost'" -w start || {
+        # Репликация
+        local   replication     all                                     trust
+        host    replication     all             127.0.0.1/32            trust
+        host    replication     all             ::1/128                 trust
+
+        # Удалённые подключения через TDS (порт 1433) и обычный Postgres-протокол
+        host    all             all             0.0.0.0/0               md5
+        host    all             all             ::/0                    md5
+PGEOF
+
+    /opt/postgres/bin/pg_ctl -D "$PGDATA" -o "-c listen_addresses='localhost'" -w start || {
         echo "[entrypoint] Не удалось запустить PostgreSQL"
         exit 1
     }
 
-    # Пароль передаётся через psql-переменную (--set + :'pw'), а не подставляется
-    # напрямую в SQL-строку — иначе пароль с одинарной кавычкой сломает синтаксис
-    # или откроет SQL-инъекцию в собственном bootstrap-скрипте.
-    psql -v ON_ERROR_STOP=1 --username postgres --set pw="${BABELFISH_PASS}" <<-SQL
-        CREATE USER ${BABELFISH_USER} WITH CREATEDB CREATEROLE PASSWORD :'pw' INHERIT;
-        DROP DATABASE IF EXISTS ${BABELFISH_DB};
-        CREATE DATABASE ${BABELFISH_DB} OWNER ${BABELFISH_USER};
+    # Пароль и идентификаторы — через psql-переменные (--set + :'pw' / :"usr"),
+    # а не подставляются напрямую в SQL-строку. :'x' — безопасный строковый
+    # литерал, :"x" — безопасный quoted identifier; оба защищают от спецсимволов
+    # в значении и от SQL-инъекции в собственном bootstrap-скрипте.
+    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
+        --set pw="${BABELFISH_PASS}" --set db="${BABELFISH_DB}" --set usr="${BABELFISH_USER}" <<-SQL
+        CREATE USER :"usr" WITH CREATEDB CREATEROLE PASSWORD :'pw' INHERIT;
+        DROP DATABASE IF EXISTS :"db";
+        CREATE DATABASE :"db" OWNER :"usr";
 SQL
 
-    psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" <<-SQL
+    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" \
+        --set usr="${BABELFISH_USER}" <<-SQL
         CREATE EXTENSION IF NOT EXISTS "babelfishpg_tds" CASCADE;
-        GRANT ALL ON SCHEMA sys TO ${BABELFISH_USER};
+        GRANT ALL ON SCHEMA sys TO :"usr";
 SQL
 
     if [ "$ENABLE_POSTGIS" = "true" ]; then
         echo "[entrypoint] Включаю PostGIS в ${BABELFISH_DB}"
-        psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" <<-SQL
+        /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" <<-SQL
             CREATE EXTENSION IF NOT EXISTS postgis;
 SQL
     fi
 
     if [ "$ENABLE_TDS_FDW" = "true" ]; then
         echo "[entrypoint] Включаю tds_fdw в ${BABELFISH_DB}"
-        psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" <<-SQL
+        /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" <<-SQL
             CREATE EXTENSION IF NOT EXISTS tds_fdw;
 SQL
     fi
 
-    psql -v ON_ERROR_STOP=1 --username postgres <<-SQL
-        ALTER SYSTEM SET babelfishpg_tsql.database_name = '${BABELFISH_DB}';
-        ALTER SYSTEM SET babelfishpg_tsql.migration_mode = '${BABELFISH_MIGRATION_MODE}';
+    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
+        --set db="${BABELFISH_DB}" --set mode="${BABELFISH_MIGRATION_MODE}" <<-SQL
+        ALTER SYSTEM SET babelfishpg_tsql.database_name = :'db';
+        ALTER DATABASE :"db" SET babelfishpg_tsql.migration_mode = :'mode';
         SELECT pg_reload_conf();
 SQL
 
-    psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" <<-SQL
-        CALL SYS.INITIALIZE_BABELFISH('${BABELFISH_USER}');
+    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" \
+        --set usr="${BABELFISH_USER}" <<-SQL
+        CALL SYS.INITIALIZE_BABELFISH(:'usr');
 SQL
 
-    if pg_ctl -D "$PGDATA" status >/dev/null 2>&1; then
-        pg_ctl -D "$PGDATA" -m fast -w stop
+    if [ "$ENABLE_GUI_CLIENT_STUBS" = "true" ]; then
+        echo "[entrypoint] Добавляю заглушки для GUI-клиентов (SSMS/Azure Data Studio) в ${BABELFISH_DB}"
+        /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" <<-SQL
+            CREATE OR REPLACE VIEW sys.dm_os_windows_info AS
+            SELECT
+                '10.0' AS windows_release,
+                'Linux' AS windows_service_pack_level,
+                0 AS windows_sku,
+                0 AS os_language_version;
+
+            CREATE OR REPLACE PROCEDURE dbo.xp_msver()
+            LANGUAGE sql
+            AS \$\$
+                SELECT 1, 'ProductName'::text, 0, 'Babelfish for PostgreSQL'::text
+                UNION ALL SELECT 2, 'ProductVersion', 0, '17.7.0'
+                UNION ALL SELECT 3, 'Language', 0, 'English (United States)'
+                UNION ALL SELECT 4, 'Platform', 0, 'Linux'
+            \$\$;
+
+            GRANT SELECT ON sys.dm_os_windows_info TO PUBLIC;
+            GRANT EXECUTE ON PROCEDURE dbo.xp_msver() TO PUBLIC;
+SQL
     fi
+
+    /opt/postgres/bin/pg_ctl -D "$PGDATA" -m fast -w stop
     echo "[entrypoint] Инициализация завершена"
 }
 
@@ -519,14 +599,18 @@ else
     echo "[entrypoint] Существующий кластер обнаружен в $PGDATA, инициализация пропущена"
 fi
 
-exec "$@" -D "$PGDATA"
+exec /opt/postgres/bin/postgres -D "$PGDATA"
 ```
 
-`ENABLE_POSTGIS` и `ENABLE_TDS_FDW` по умолчанию `true`, так как оба расширения уже собраны в образ (раздел 6). Поставьте `Environment=ENABLE_POSTGIS=false` и/или `Environment=ENABLE_TDS_FDW=false` в Quadlet-юните, если что-то из этого не нужно в конкретной базе — сами библиотеки при этом останутся в образе, просто `CREATE EXTENSION` не выполнится.
+`ENABLE_POSTGIS` и `ENABLE_TDS_FDW` по умолчанию `true`, так как оба расширения уже собраны в образ (раздел 6). Поставьте `Environment=ENABLE_POSTGIS=false` и/или `Environment=ENABLE_TDS_FDW=false` в Quadlet-юните, если что-то из этого не нужно в конкретной базе.
 
-Обратите внимание: `CREATE EXTENSION tds_fdw` только регистрирует сам foreign data wrapper — сервер и логин для конкретного linked server (`CREATE SERVER ... FOREIGN DATA WRAPPER tds_fdw`, `CREATE USER MAPPING ...`) нужно создавать вручную под свои реквизиты подключения, автоматизировать это в entrypoint нельзя — целевой сервер и его учётные данные заранее не известны.
+Обратите внимание: `CREATE EXTENSION tds_fdw` только регистрирует сам foreign data wrapper — сервер и логин для конкретного linked server (`CREATE SERVER ... FOREIGN DATA WRAPPER tds_fdw`, `CREATE USER MAPPING ...`) нужно создавать вручную под свои реквизиты подключения, автоматизировать это в entrypoint нельзя.
 
-**Важно про порядок:** пароль суперпользователя ставится через `--pwfile` **на этапе `initdb`**, до какого-либо `psql`-подключения. Не пытайтесь переставить это на `ALTER USER postgres PASSWORD ...` через `psql` сразу после `initdb`, но до `pg_ctl start` — сервер в этот момент ещё не запущен, `psql` не сможет подключиться, скрипт упадёт на `set -e`, а `PG_VERSION` к этому моменту уже будет создан — при следующем перезапуске контейнера entrypoint решит, что кластер уже проинициализирован, и молча пропустит весь блок (без пароля, без `shared_preload_libraries`, без TDS). Это состояние трудно диагностировать и ещё сложнее откатить без потери данных.
+**Про заглушки GUI-клиентов (`ENABLE_GUI_CLIENT_STUBS`):** это не официально документированная функциональность Babelfish, а самодельный обход конкретных ошибок, с которыми иногда сталкиваются SSMS/Azure Data Studio при подключении (эти инструменты пытаются вызвать `xp_msver`/прочитать `sys.dm_os_windows_info` при коннекте). По умолчанию выключено (`false`) — включайте, только если реально столкнулись с проблемой подключения именно этих клиентов; для `sqlcmd`/`tsql`/обычных приложений не требуется.
+
+**Про `password_encryption = 'md5'`:** это наиболее вероятная причина, почему T-SQL/TDS-функционал ещё не был подтверждён рабочим в более ранних итерациях этого гайда (см. раздел 28) — TDS как wire-протокол не умеет в SCRAM. Сама эта гипотеза пока тоже не проверена end-to-end реальным TDS-подключением — проверьте после разворачивания и обновите раздел 28, если что-то не сойдётся.
+
+**Важно про порядок:** пароль суперпользователя ставится через `--pwfile` **на этапе `initdb`**, до какого-либо `psql`-подключения. Не переставляйте это на `ALTER USER postgres PASSWORD ...` через `psql` сразу после `initdb`, но до `pg_ctl start` — сервер в этот момент ещё не запущен, `psql` не сможет подключиться, скрипт упадёт на `set -e`, а `PG_VERSION` уже будет создан — при следующем перезапуске контейнера entrypoint решит, что кластер уже проинициализирован, и молча пропустит весь блок.
 
 ```bash
 chmod +x entrypoint.sh
@@ -1025,6 +1109,8 @@ jobs:
 | `cp: cannot stat libantlr4-runtime.so...` | CMake на RHEL кладёт `.so` в `lib64`, а не `lib` | Использовать `find` по обоим путям (уже в `Containerfile`, раздел 6) |
 | `UnsupportedClassVersionError` при запуске ANTLR jar | Резолвится не та JVM (например, старая Java 8 вместо явно указанной) | Явный `ENV JAVA_HOME`/`PATH` + `-DJava_JAVA_EXECUTABLE` (уже в `Containerfile`, раздел 6) |
 | `error while loading shared libraries: libreadline.so...` при запуске psql | В runtime не хватает `readline`/`zlib`, хотя движок собран с их поддержкой | Убедиться, что `readline zlib` есть в runtime `dnf install` (уже в `Containerfile`, раздел 6) |
+| `sqlcmd`/`tsql` не могут авторизоваться по TDS (порт 1433), хотя `psql` по 5432 подключается нормально | TDS-протокол не поддерживает SCRAM-SHA-256 — нужен `md5` | Проверить `SHOW password_encryption;` (должно быть `md5`) и метод в `pg_hba.conf` для соответствующей записи (раздел 7) |
+| `could not access file "$libdir/babelfishpg_tsql-N"` при `CREATE EXTENSION` | Внутренний ABI-суффикс версии библиотеки Babelfish не совпадает с реально созданным символическим именем | Проверить фактическое имя файла в ошибке, поправить суффикс в символических ссылках (раздел 6) |
 
 ---
 
@@ -1041,10 +1127,12 @@ jobs:
 
 ## 28. Статус и открытые вопросы
 
-**Статус:** `Containerfile` в разделе 6 — подтверждённо рабочая **сборка** (`podman build` проходит от `git clone` до финального образа без ошибок на всех четырёх расширениях, PostGIS и tds_fdw). Это результат нескольких итераций отладки реальных ошибок сборки на AlmaLinux 9. **Важная оговорка:** реальный запуск контейнера (успешная инициализация БД через `entrypoint.sh`, подключение `psql`/`tsql`) на момент последнего обновления гайда ещё не подтверждён end-to-end — если у вас что-то упадёт уже после старта контейнера, а не на этапе `podman build`, смотрите раздел 26 (Диагностика) и пункт 3 ниже в первую очередь.
+**Статус:** `Containerfile` (раздел 6) — подтверждённо рабочая **сборка** (`podman build` проходит от `git clone` до финального образа без ошибок на всех четырёх расширениях, PostGIS и tds_fdw). `entrypoint.sh` (раздел 7, более ранняя версия без `md5`) подтверждённо **успешно запускается**: контейнер стартует, инициализация кластера через `entrypoint.sh` проходит целиком без падений (значит, все вызовы `psql` внутри скрипта отработали — в том числе это косвенно подтверждает, что `readline`/`zlib` в runtime не были проблемой). **Не подтверждено:** реальное T-SQL/TDS-подключение (`sqlcmd`/`tsql`/SSMS на порт 1433) и работоспособность `password_encryption = 'md5'` конкретно для этого — это гипотеза, устраняющая известное ограничение TDS-протокола (несовместимость с SCRAM-SHA-256), но ещё не проверенная end-to-end.
 
 Открытые вопросы, требующие вашего решения или проверки:
 
 1. **Включение PostGIS/tds_fdw в БД по умолчанию.** Сейчас `entrypoint.sh` делает `CREATE EXTENSION` автоматически. Если хотите включать вручную под конкретную задачу — поменяйте дефолт на `false` в переменных `ENABLE_POSTGIS`/`ENABLE_TDS_FDW`.
 2. **Секреты через env-файл vs `podman secret`.** Гайд использует env-файл (раздел 10.1) как более простой вариант. Для более строгого изолирования секретов — доработайте `entrypoint.sh` под `*_FILE`-переменные и переходите на `podman secret` (раздел 10.2).
-3. **`readline`/`zlib` в runtime — технический риск, не проверено на реальном запуске.** Движок собирается без `--without-readline --without-zlib`, поэтому `psql` (используется в `entrypoint.sh` для всей инициализации) вероятно слинкован против `libreadline.so`/`libz.so`. Явные `readline zlib` в runtime `dnf install` (раздел 6) — подстраховка; возможно, они избыточны, если `libreadline` и так тянется транзитивно через пакет `bash` в AlmaLinux 9, но это не подтверждено на практике. Первый реальный `systemctl start babelfish.service` покажет однозначно — если увидите `error while loading shared libraries`, это будет означать, что подстраховка была не лишней.
+3. **T-SQL/TDS-подключение — главный оставшийся непроверенный пункт.** После деплоя обязательно проверьте `tsql -H <host> -p 1433 -U babelfish_user -P '<пароль>'` (раздел 15/17) и хотя бы один реальный T-SQL-запрос. Если подключение не проходит — первое, что проверять: действительно ли `password_encryption = 'md5'` применился (`SHOW password_encryption;` внутри контейнера) и совпадает ли метод в `pg_hba.conf` с тем, что реально шлёт клиент.
+4. **Суффикс `-5` в символических ссылках `babelfishpg_tsql-5.so`/`babelfishpg_common-5.so` (раздел 6).** Подобран под `BABEL_5_4_0` по аналогии с номером релиза — не подтверждён как официально документированное правило именования Babelfish. Контейнер с этими симлинками успешно прошёл инициализацию, что говорит в пользу того, что они как минимум не мешают; но не проверено, действительно ли они были *необходимы*, или расширения загрузились бы и без них. При смене версии Babelfish перепроверяйте по факту ошибки `could not access file`, если она возникнет.
+5. **`ENABLE_GUI_CLIENT_STUBS` (заглушки `xp_msver`/`sys.dm_os_windows_info`).** Неофициальный обход под конкретные GUI-клиенты, выключен по умолчанию. Включайте только если реально столкнулись с проблемой подключения SSMS/Azure Data Studio.
