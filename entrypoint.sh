@@ -16,7 +16,6 @@ init_db() {
     /opt/postgres/bin/initdb -D "$PGDATA" --username=postgres --pwfile=/tmp/pgpass --encoding=UTF8 --locale=en_US.UTF-8
     rm -f /tmp/pgpass
 
-    # Конфигурация PostgreSQL — ВСЕ параметры ДО первого запуска
     {
         echo "listen_addresses = '*'"
         echo "port = 5432"
@@ -51,40 +50,27 @@ SQL
 
     # 2. Установка расширений Babelfish
     /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
-        --dbname "${BABELFISH_DB}" --set usr="${BABELFISH_USER}" <<-SQL
+        --dbname "${BABELFISH_DB}" <<-SQL
         CREATE EXTENSION IF NOT EXISTS "babelfishpg_tsql" CASCADE;
         CREATE EXTENSION IF NOT EXISTS "babelfishpg_tds" CASCADE;
 SQL
 
-    # 3. ВАЖНО: Права на схемы ДО инициализации Babelfish!
-    # Это позволяет INITIALIZE_BABELFISH создать все объекты от имени пользователя
+    # 3. Права на схему sys (существует после CREATE EXTENSION)
     /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
         --dbname "${BABELFISH_DB}" --set usr="${BABELFISH_USER}" <<-SQL
         GRANT ALL ON SCHEMA sys TO :"usr";
-        GRANT ALL ON SCHEMA dbo TO :"usr";
-        GRANT ALL ON SCHEMA information_schema_tsql TO :"usr";
 SQL
 
-    # 4. Инициализация Babelfish — создаёт системные таблицы И регистрирует login
+    # 4. Инициализация Babelfish (создаёт master_dbo, tempdb_dbo, msdb_dbo,
+    #    системные таблицы, роли sysadmin/bbf_role_admin, регистрирует login)
     /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
         --dbname "${BABELFISH_DB}" --set usr="${BABELFISH_USER}" <<-SQL
         CALL SYS.INITIALIZE_BABELFISH(:'usr');
 SQL
 
-    # 5. Дополнительные права ПОСЛЕ инициализации
+    # 5. Объекты-заглушки для совместимости с Azure Data Studio / SSMS
     /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
-        --dbname "${BABELFISH_DB}" --set usr="${BABELFISH_USER}" <<-SQL
-        GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA dbo TO :"usr";
-        GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA dbo TO :"usr";
-        GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA dbo TO :"usr";
-        ALTER DEFAULT PRIVILEGES IN SCHEMA dbo GRANT ALL ON TABLES TO :"usr";
-        ALTER DEFAULT PRIVILEGES IN SCHEMA dbo GRANT ALL ON SEQUENCES TO :"usr";
-        ALTER DEFAULT PRIVILEGES IN SCHEMA dbo GRANT ALL ON FUNCTIONS TO :"usr";
-SQL
-
-    # 6. Создание объектов-заглушек для совместимости с Azure Data Studio / SSMS
-    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
-        --dbname "${BABELFISH_DB}" <<-SQL
+        --dbname "${BABELFISH_DB}" --set usr="${BABELFISH_USER}" <<-'SQL'
         CREATE OR REPLACE VIEW sys.dm_os_windows_info AS
         SELECT 
             '10.0' AS windows_release,
@@ -92,17 +78,13 @@ SQL
             0 AS windows_sku,
             0 AS os_language_version;
 
-        CREATE OR REPLACE PROCEDURE dbo.xp_msver()
-        LANGUAGE sql
-        AS \$sql\$SELECT 1, CAST('ProductName' AS TEXT), 0, CAST('Babelfish for PostgreSQL' AS TEXT) UNION ALL SELECT 2, 'ProductVersion', 0, '17.7.0' UNION ALL SELECT 3, 'Language', 0, 'English (United States)' UNION ALL SELECT 4, 'Platform', 0, 'Linux' UNION ALL SELECT 5, 'Comments', 0, 'Babelfish for PostgreSQL with SQL Server Compatibility' UNION ALL SELECT 6, 'CompanyName', 0, 'Babelfish for PostgreSQL Project' UNION ALL SELECT 7, 'FileDescription', 0, 'PostgreSQL Server' UNION ALL SELECT 8, 'FileVersion', 0, '17.7' UNION ALL SELECT 9, 'InternalName', 0, 'postgres' UNION ALL SELECT 10, 'LegalCopyright', 0, 'See PostgreSQL copyright' UNION ALL SELECT 11, 'LegalTrademarks', 0, '' UNION ALL SELECT 12, 'OriginalFilename', 0, 'postgres' UNION ALL SELECT 13, 'PrivateBuild', 0, NULL UNION ALL SELECT 14, 'SpecialBuild', 0, NULL\$sql\$;
+        ALTER VIEW sys.dm_os_windows_info OWNER TO :"usr";
 
         CREATE OR REPLACE PROCEDURE master_dbo.xp_msver()
         LANGUAGE sql
-        AS \$sql\$SELECT 1, CAST('ProductName' AS TEXT), 0, CAST('Babelfish for PostgreSQL' AS TEXT) UNION ALL SELECT 2, 'ProductVersion', 0, '17.7.0' UNION ALL SELECT 3, 'Language', 0, 'English (United States)' UNION ALL SELECT 4, 'Platform', 0, 'Linux' UNION ALL SELECT 5, 'Comments', 0, 'Babelfish for PostgreSQL with SQL Server Compatibility' UNION ALL SELECT 6, 'CompanyName', 0, 'Babelfish for PostgreSQL Project' UNION ALL SELECT 7, 'FileDescription', 0, 'PostgreSQL Server' UNION ALL SELECT 8, 'FileVersion', 0, '17.7' UNION ALL SELECT 9, 'InternalName', 0, 'postgres' UNION ALL SELECT 10, 'LegalCopyright', 0, 'See PostgreSQL copyright' UNION ALL SELECT 11, 'LegalTrademarks', 0, '' UNION ALL SELECT 12, 'OriginalFilename', 0, 'postgres' UNION ALL SELECT 13, 'PrivateBuild', 0, NULL UNION ALL SELECT 14, 'SpecialBuild', 0, NULL\$sql\$;
+        AS $sql$SELECT 1, CAST('ProductName' AS TEXT), 0, CAST('Babelfish for PostgreSQL' AS TEXT) UNION ALL SELECT 2, 'ProductVersion', 0, '17.7.0' UNION ALL SELECT 3, 'Language', 0, 'English (United States)' UNION ALL SELECT 4, 'Platform', 0, 'Linux' UNION ALL SELECT 5, 'Comments', 0, 'Babelfish for PostgreSQL with SQL Server Compatibility' UNION ALL SELECT 6, 'CompanyName', 0, 'Babelfish for PostgreSQL Project' UNION ALL SELECT 7, 'FileDescription', 0, 'PostgreSQL Server' UNION ALL SELECT 8, 'FileVersion', 0, '17.7' UNION ALL SELECT 9, 'InternalName', 0, 'postgres' UNION ALL SELECT 10, 'LegalCopyright', 0, 'See PostgreSQL copyright' UNION ALL SELECT 11, 'LegalTrademarks', 0, '' UNION ALL SELECT 12, 'OriginalFilename', 0, 'postgres' UNION ALL SELECT 13, 'PrivateBuild', 0, NULL UNION ALL SELECT 14, 'SpecialBuild', 0, NULL$sql$;
 
-        GRANT SELECT ON sys.dm_os_windows_info TO PUBLIC;
-        GRANT EXECUTE ON PROCEDURE dbo.xp_msver() TO PUBLIC;
-        GRANT EXECUTE ON PROCEDURE master_dbo.xp_msver() TO PUBLIC;
+        ALTER PROCEDURE master_dbo.xp_msver() OWNER TO :"usr";
 SQL
 
     /opt/postgres/bin/pg_ctl -D "$PGDATA" -m fast -w stop
@@ -116,4 +98,4 @@ else
 fi
 
 exec /opt/postgres/bin/postgres -D "$PGDATA"
-chmod +x /opt/babelfish-image/entrypoint.sh
+EOF
