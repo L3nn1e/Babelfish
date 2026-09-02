@@ -115,22 +115,13 @@ SQL
         \$sql\$;
         ALTER PROCEDURE master_dbo.xp_msver() OWNER TO :"usr";
 
-        -- T-SQL обёртка для PostGIS_Version()
-        CREATE OR REPLACE FUNCTION master_dbo.postgis_version()
-        RETURNS TEXT LANGUAGE plpgsql AS \$\$
-        BEGIN
-            RETURN public.postgis_version();
-        END;
-        \$\$;
-        ALTER FUNCTION master_dbo.postgis_version() OWNER TO :"usr";
-
-        -- T-SQL обёртка для ST_Distance
+        -- T-SQL обёртка для ST_Distance (с явным указанием схемы public)
         CREATE OR REPLACE FUNCTION master_dbo.st_distance_geography(TEXT, TEXT)
         RETURNS DOUBLE PRECISION LANGUAGE plpgsql AS \$\$
         BEGIN
-            RETURN ST_Distance(
-                ST_GeographyFromText(\$1),
-                ST_GeographyFromText(\$2)
+            RETURN public.ST_Distance(
+                public.ST_GeographyFromText(\$1),
+                public.ST_GeographyFromText(\$2)
             );
         END;
         \$\$;
