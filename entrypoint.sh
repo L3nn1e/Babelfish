@@ -24,6 +24,7 @@ init_db() {
         --locale=en_US.UTF-8
     rm -f /tmp/pgpass
 
+    # postgresql.conf
     {
         echo "listen_addresses = '*'"
         echo "port = 5432"
@@ -35,6 +36,7 @@ init_db() {
         echo "babelfishpg_tsql.database_name = '${BABELFISH_DB}'"
     } >> "$PGDATA/postgresql.conf"
 
+    # pg_hba.conf
     cat > "$PGDATA/pg_hba.conf" <<PGEOF
 local   all             all                                     trust
 host    all             all             127.0.0.1/32            trust
@@ -72,7 +74,7 @@ SQL
         CREATE EXTENSION IF NOT EXISTS tds_fdw;
 SQL
 
-    # 4. Права на схему sys
+    # 4. Права на схему sys (ДО инициализации!)
     /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
         --dbname "${BABELFISH_DB}" \
         --set usr="${BABELFISH_USER}" <<-SQL
@@ -87,13 +89,15 @@ SQL
 SQL
 
     # 6. Заглушки для SSMS/ADS + T-SQL обёртки для PostGIS
+    # ВАЖНО: используем <<-SQL без кавычек, чтобы :"usr" подставился
+    #        и экранируем \$\$ для PL/pgSQL
     /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
         --dbname "${BABELFISH_DB}" \
-        --set usr="${BABELFISH_USER}" <<-'SQL'
+        --set usr="${BABELFISH_USER}" <<-SQL
         -- Заглушка для master.dbo.xp_msver
         CREATE OR REPLACE PROCEDURE master_dbo.xp_msver()
         LANGUAGE sql
-        AS $sql$
+        AS \$sql\$
             SELECT 1, CAST('ProductName' AS TEXT), 0, CAST('Babelfish for PostgreSQL' AS TEXT)
             UNION ALL SELECT 2, 'ProductVersion', 0, '17.7.0'
             UNION ALL SELECT 3, 'Language', 0, 'English (United States)'
@@ -108,28 +112,28 @@ SQL
             UNION ALL SELECT 12, 'OriginalFilename', 0, 'postgres'
             UNION ALL SELECT 13, 'PrivateBuild', 0, NULL
             UNION ALL SELECT 14, 'SpecialBuild', 0, NULL
-        $sql$;
+        \$sql\$;
         ALTER PROCEDURE master_dbo.xp_msver() OWNER TO :"usr";
 
         -- T-SQL обёртка для PostGIS_Version()
         CREATE OR REPLACE FUNCTION master_dbo.postgis_version()
-        RETURNS TEXT LANGUAGE plpgsql AS $$
+        RETURNS TEXT LANGUAGE plpgsql AS \$\$
         BEGIN
             RETURN public.postgis_version();
         END;
-        $$;
+        \$\$;
         ALTER FUNCTION master_dbo.postgis_version() OWNER TO :"usr";
 
         -- T-SQL обёртка для ST_Distance
         CREATE OR REPLACE FUNCTION master_dbo.st_distance_geography(TEXT, TEXT)
-        RETURNS DOUBLE PRECISION LANGUAGE plpgsql AS $$
+        RETURNS DOUBLE PRECISION LANGUAGE plpgsql AS \$\$
         BEGIN
             RETURN ST_Distance(
-                ST_GeographyFromText($1),
-                ST_GeographyFromText($2)
+                ST_GeographyFromText(\$1),
+                ST_GeographyFromText(\$2)
             );
         END;
-        $$;
+        \$\$;
         ALTER FUNCTION master_dbo.st_distance_geography(TEXT, TEXT) OWNER TO :"usr";
 SQL
 
@@ -137,7 +141,7 @@ SQL
     
     echo "[entrypoint] Инициализация Babelfish завершена успешно"
     echo "[entrypoint] Установленные расширения: babelfishpg_tsql, babelfishpg_tds, postgis, tds_fdw"
-    echo "[entrypoint] T-SQL обёртки для PostGIS: master_dbo.postgis_version(), master_dbo.st_distance_geography()"
+    echo "[entrypoint] T-SQL обёртки: master_dbo.postgis_version(), master_dbo.st_distance_geography()"
 }
 
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
