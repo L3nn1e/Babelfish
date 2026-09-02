@@ -1,4 +1,3 @@
-cat << 'EOF' > /opt/babelfish-image/entrypoint.sh
 #!/bin/bash
 # =============================================================================
 # Babelfish for PostgreSQL - Entrypoint Script
@@ -203,5 +202,3 @@ fi
 
 # Запускаем PostgreSQL в foreground (требуется для systemd/container)
 exec /opt/postgres/bin/postgres -D "$PGDATA"
-EOF
-chmod +x /opt/babelfish-image/entrypoint.sh
