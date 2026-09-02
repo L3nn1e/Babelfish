@@ -24,7 +24,6 @@ init_db() {
         --locale=en_US.UTF-8
     rm -f /tmp/pgpass
 
-    # postgresql.conf
     {
         echo "listen_addresses = '*'"
         echo "port = 5432"
@@ -36,7 +35,6 @@ init_db() {
         echo "babelfishpg_tsql.database_name = '${BABELFISH_DB}'"
     } >> "$PGDATA/postgresql.conf"
 
-    # pg_hba.conf
     cat > "$PGDATA/pg_hba.conf" <<PGEOF
 local   all             all                                     trust
 host    all             all             127.0.0.1/32            trust
@@ -50,7 +48,6 @@ PGEOF
 
     /opt/postgres/bin/pg_ctl -D "$PGDATA" -o "-c listen_addresses='localhost'" -w start
 
-    # 1. Пользователь и БД
     /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
         --set pw="${BABELFISH_PASS}" \
         --set db="${BABELFISH_DB}" \
@@ -60,41 +57,33 @@ PGEOF
         CREATE DATABASE :"db" OWNER :"usr";
 SQL
 
-    # 2. Расширения Babelfish
     /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
         --dbname "${BABELFISH_DB}" <<-SQL
         CREATE EXTENSION IF NOT EXISTS "babelfishpg_tsql" CASCADE;
         CREATE EXTENSION IF NOT EXISTS "babelfishpg_tds" CASCADE;
 SQL
 
-    # 3. Дополнительные расширения
     /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
         --dbname "${BABELFISH_DB}" <<-SQL
         CREATE EXTENSION IF NOT EXISTS postgis;
         CREATE EXTENSION IF NOT EXISTS tds_fdw;
 SQL
 
-    # 4. Права на схему sys (ДО инициализации!)
     /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
         --dbname "${BABELFISH_DB}" \
         --set usr="${BABELFISH_USER}" <<-SQL
         GRANT ALL ON SCHEMA sys TO :"usr";
 SQL
 
-    # 5. Инициализация Babelfish
     /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
         --dbname "${BABELFISH_DB}" \
         --set usr="${BABELFISH_USER}" <<-SQL
         CALL SYS.INITIALIZE_BABELFISH(:'usr');
 SQL
 
-    # 6. Заглушки для SSMS/ADS + T-SQL обёртки для PostGIS
-    # ВАЖНО: используем <<-SQL без кавычек, чтобы :"usr" подставился
-    #        и экранируем \$\$ для PL/pgSQL
     /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
         --dbname "${BABELFISH_DB}" \
         --set usr="${BABELFISH_USER}" <<-SQL
-        -- Заглушка для master.dbo.xp_msver
         CREATE OR REPLACE PROCEDURE master_dbo.xp_msver()
         LANGUAGE sql
         AS \$sql\$
@@ -115,13 +104,29 @@ SQL
         \$sql\$;
         ALTER PROCEDURE master_dbo.xp_msver() OWNER TO :"usr";
 
-        -- T-SQL обёртка для ST_Distance (с явным указанием схемы public)
-        CREATE OR REPLACE FUNCTION master_dbo.st_distance_geography(TEXT, TEXT)
-        RETURNS DOUBLE PRECISION LANGUAGE plpgsql AS \$\$
+        CREATE OR REPLACE FUNCTION master_dbo.postgis_version()
+        RETURNS TEXT 
+        LANGUAGE plpgsql 
+        SECURITY DEFINER
+        SET search_path = public, pg_temp
+        AS \$\$
         BEGIN
-            RETURN public.ST_Distance(
-                public.ST_GeographyFromText(\$1),
-                public.ST_GeographyFromText(\$2)
+            RETURN postgis_version();
+        END;
+        \$\$;
+        ALTER FUNCTION master_dbo.postgis_version() OWNER TO :"usr";
+
+        -- ИСПРАВЛЕНИЕ: SECURITY DEFINER + SET search_path
+        CREATE OR REPLACE FUNCTION master_dbo.st_distance_geography(TEXT, TEXT)
+        RETURNS DOUBLE PRECISION 
+        LANGUAGE plpgsql 
+        SECURITY DEFINER
+        SET search_path = public, pg_temp
+        AS \$\$
+        BEGIN
+            RETURN ST_Distance(
+                ST_GeographyFromText(\$1),
+                ST_GeographyFromText(\$2)
             );
         END;
         \$\$;
@@ -131,8 +136,6 @@ SQL
     /opt/postgres/bin/pg_ctl -D "$PGDATA" -m fast -w stop
     
     echo "[entrypoint] Инициализация Babelfish завершена успешно"
-    echo "[entrypoint] Установленные расширения: babelfishpg_tsql, babelfishpg_tds, postgis, tds_fdw"
-    echo "[entrypoint] T-SQL обёртки: master_dbo.postgis_version(), master_dbo.st_distance_geography()"
 }
 
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
