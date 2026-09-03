@@ -453,6 +453,32 @@ ENTRYPOINT ["entrypoint.sh"]
 
 ```bash
 #!/bin/bash
+# =============================================================================
+# Babelfish for PostgreSQL — entrypoint
+# =============================================================================
+# Переменные окружения:
+#   POSTGRES_PASSWORD          — пароль суперпользователя postgres (ОБЯЗАТЕЛЬНО)
+#   BABELFISH_USER             — имя T-SQL пользователя (по умолчанию: babelfish_user)
+#   BABELFISH_PASS             — пароль T-SQL пользователя (по умолчанию: $POSTGRES_PASSWORD)
+#   BABELFISH_DB               — имя базы Babelfish (по умолчанию: babelfish_db)
+#   BABELFISH_MIGRATION_MODE   — single-db или multi-db (по умолчанию: multi-db)
+#   ENABLE_POSTGIS             — создавать ли расширение PostGIS (по умолчанию: true)
+#   ENABLE_TDS_FDW             — создавать ли расширение tds_fdw (по умолчанию: true)
+#
+# Порядок инициализации — важно не менять местами:
+#   1. babelfishpg_tsql.database_name и .migration_mode пишутся в postgresql.conf
+#      ДО первого запуска сервера — если задавать их позже через ALTER SYSTEM,
+#      TDS-сервер (запущен как preloaded background worker) рискует не увидеть
+#      актуальное значение в рамках той же сессии.
+#   2. CREATE EXTENSION создаёт схему sys — GRANT на sys можно делать сразу.
+#   3. Схемы dbo/master_dbo/tempdb_dbo/msdb_dbo создаются ТОЛЬКО процедурой
+#      SYS.INITIALIZE_BABELFISH — GRANT на них до её вызова упадёт с
+#      "schema does not exist". Сама процедура делает переданного пользователя
+#      sysadmin-эквивалентом, что уже даёт полный доступ к этим схемам —
+#      отдельный explicit GRANT на dbo после неё не требуется.
+#   4. password_encryption = 'md5' — TDS как wire-протокол не поддерживает
+#      SCRAM-SHA-256, это ограничение самого протокола, а не PostgreSQL.
+# =============================================================================
 set -euo pipefail
 
 PGDATA="${PGDATA:-/var/storage/pgsql/data}"
@@ -461,23 +487,21 @@ BABELFISH_USER="${BABELFISH_USER:-babelfish_user}"
 BABELFISH_PASS="${BABELFISH_PASS:-$POSTGRES_PASSWORD}"
 BABELFISH_DB="${BABELFISH_DB:-babelfish_db}"
 BABELFISH_MIGRATION_MODE="${BABELFISH_MIGRATION_MODE:-multi-db}"
+ENABLE_POSTGIS="${ENABLE_POSTGIS:-true}"
+ENABLE_TDS_FDW="${ENABLE_TDS_FDW:-true}"
 
 init_db() {
     echo "[entrypoint] Инициализация нового кластера в $PGDATA"
-    echo "[entrypoint] Режим миграции: $BABELFISH_MIGRATION_MODE"
-    echo "[entrypoint] База данных: $BABELFISH_DB"
-    echo "[entrypoint] Пользователь: $BABELFISH_USER"
+    echo "[entrypoint] Режим миграции: $BABELFISH_MIGRATION_MODE, база: $BABELFISH_DB, пользователь: $BABELFISH_USER"
 
     printf "%s" "$POSTGRES_PASSWORD" > /tmp/pgpass
     chmod 600 /tmp/pgpass
-    
-    /opt/postgres/bin/initdb -D "$PGDATA" \
-        --username=postgres \
-        --pwfile=/tmp/pgpass \
-        --encoding=UTF8 \
-        --locale=en_US.UTF-8
+    /opt/postgres/bin/initdb -D "$PGDATA" --username=postgres --pwfile=/tmp/pgpass \
+        --encoding=UTF8 --locale=en_US.UTF-8
     rm -f /tmp/pgpass
 
+    # database_name и migration_mode — сразу в файл, до первого старта (см.
+    # пояснение в шапке файла, пункт 1).
     {
         echo "listen_addresses = '*'"
         echo "port = 5432"
@@ -489,6 +513,8 @@ init_db() {
         echo "babelfishpg_tsql.database_name = '${BABELFISH_DB}'"
     } >> "$PGDATA/postgresql.conf"
 
+    # Полностью переопределяем pg_hba.conf, а не дописываем к дефолту от
+    # initdb — так весь набор разрешённых подключений явный и предсказуемый.
     cat > "$PGDATA/pg_hba.conf" <<PGEOF
 local   all             all                                     trust
 host    all             all             127.0.0.1/32            trust
@@ -500,96 +526,129 @@ host    all             all             0.0.0.0/0               md5
 host    all             all             ::/0                    md5
 PGEOF
 
-    /opt/postgres/bin/pg_ctl -D "$PGDATA" -o "-c listen_addresses='localhost'" -w start
+    /opt/postgres/bin/pg_ctl -D "$PGDATA" -o "-c listen_addresses='localhost'" -w start || {
+        echo "[entrypoint] Не удалось запустить PostgreSQL"
+        exit 1
+    }
 
+    # Пароль и идентификаторы — через psql-переменные (--set + :'pw' / :"usr"),
+    # а не подставляются напрямую в SQL-строку.
     /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
-        --set pw="${BABELFISH_PASS}" \
-        --set db="${BABELFISH_DB}" \
-        --set usr="${BABELFISH_USER}" <<-SQL
+        --set pw="${BABELFISH_PASS}" --set db="${BABELFISH_DB}" --set usr="${BABELFISH_USER}" <<-SQL
         CREATE USER :"usr" WITH CREATEDB CREATEROLE PASSWORD :'pw' INHERIT;
         DROP DATABASE IF EXISTS :"db";
         CREATE DATABASE :"db" OWNER :"usr";
 SQL
 
-    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
-        --dbname "${BABELFISH_DB}" <<-SQL
+    # Оба расширения создаём явно, а не полагаемся на CASCADE от одного —
+    # неизвестно заранее, кто от кого зависит в графе.
+    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" \
+        --set usr="${BABELFISH_USER}" <<-SQL
         CREATE EXTENSION IF NOT EXISTS "babelfishpg_tsql" CASCADE;
         CREATE EXTENSION IF NOT EXISTS "babelfishpg_tds" CASCADE;
-SQL
-
-    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
-        --dbname "${BABELFISH_DB}" <<-SQL
-        CREATE EXTENSION IF NOT EXISTS postgis;
-        CREATE EXTENSION IF NOT EXISTS tds_fdw;
-SQL
-
-    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
-        --dbname "${BABELFISH_DB}" \
-        --set usr="${BABELFISH_USER}" <<-SQL
         GRANT ALL ON SCHEMA sys TO :"usr";
 SQL
 
-    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
-        --dbname "${BABELFISH_DB}" \
+    if [ "$ENABLE_POSTGIS" = "true" ]; then
+        echo "[entrypoint] Включаю PostGIS в ${BABELFISH_DB}"
+        /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" <<-SQL
+            CREATE EXTENSION IF NOT EXISTS postgis;
+SQL
+    fi
+
+    if [ "$ENABLE_TDS_FDW" = "true" ]; then
+        echo "[entrypoint] Включаю tds_fdw в ${BABELFISH_DB}"
+        /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" <<-SQL
+            CREATE EXTENSION IF NOT EXISTS tds_fdw;
+SQL
+    fi
+
+    # ВАЖНО: до этой точки схемы dbo/master_dbo/tempdb_dbo/msdb_dbo ещё не
+    # существуют — GRANT на них до CALL SYS.INITIALIZE_BABELFISH упадёт с
+    # "schema does not exist". Сама процедура делает переданного пользователя
+    # sysadmin-эквивалентом, что уже покрывает нужные права на эти схемы.
+    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" \
         --set usr="${BABELFISH_USER}" <<-SQL
         CALL SYS.INITIALIZE_BABELFISH(:'usr');
 SQL
 
-    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres \
-        --dbname "${BABELFISH_DB}" \
-        --set usr="${BABELFISH_USER}" <<-SQL
-        CREATE OR REPLACE PROCEDURE master_dbo.xp_msver()
+    # Заглушки под GUI-клиенты (SSMS/Azure Data Studio) + мост PostGIS -> T-SQL.
+    # Квотированный ограничитель heredoc (<<-'SQL') отключает раскрытие bash
+    # внутри блока целиком — не нужно экранировать $$ для dollar-quoting,
+    # при этом :"usr" по-прежнему подставляется самим psql (это не то, что
+    # трогает bash).
+    /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" \
+        --set usr="${BABELFISH_USER}" <<-'SQL'
+        -- sys.dm_os_windows_info намеренно НЕ создаём: ADS корректно
+        -- обрабатывает "relation does not exist", а вот "permission denied"
+        -- от VIEW с урезанными правами выглядит хуже для пользователя.
+
+        CREATE OR REPLACE PROCEDURE dbo.xp_msver()
         LANGUAGE sql
-        AS \$sql\$
-            SELECT 1, CAST('ProductName' AS TEXT), 0, CAST('Babelfish for PostgreSQL' AS TEXT)
+        AS $sql$
+            SELECT 1, 'ProductName'::text, 0, 'Babelfish for PostgreSQL'::text
             UNION ALL SELECT 2, 'ProductVersion', 0, '17.7.0'
             UNION ALL SELECT 3, 'Language', 0, 'English (United States)'
             UNION ALL SELECT 4, 'Platform', 0, 'Linux'
-            UNION ALL SELECT 5, 'Comments', 0, 'Babelfish for PostgreSQL with SQL Server Compatibility'
-            UNION ALL SELECT 6, 'CompanyName', 0, 'Babelfish for PostgreSQL Project'
-            UNION ALL SELECT 7, 'FileDescription', 0, 'PostgreSQL Server'
-            UNION ALL SELECT 8, 'FileVersion', 0, '17.7'
-            UNION ALL SELECT 9, 'InternalName', 0, 'postgres'
-            UNION ALL SELECT 10, 'LegalCopyright', 0, 'See PostgreSQL copyright'
-            UNION ALL SELECT 11, 'LegalTrademarks', 0, ''
-            UNION ALL SELECT 12, 'OriginalFilename', 0, 'postgres'
-            UNION ALL SELECT 13, 'PrivateBuild', 0, NULL
-            UNION ALL SELECT 14, 'SpecialBuild', 0, NULL
-        \$sql\$;
+        $sql$;
+        ALTER PROCEDURE dbo.xp_msver() OWNER TO :"usr";
+
+        -- master_dbo — то же самое для вызовов master.dbo.xp_msver
+        -- (некоторые клиенты обращаются именно так, а не через dbo напрямую).
+        CREATE OR REPLACE PROCEDURE master_dbo.xp_msver()
+        LANGUAGE sql
+        AS $sql$
+            SELECT 1, 'ProductName'::text, 0, 'Babelfish for PostgreSQL'::text
+            UNION ALL SELECT 2, 'ProductVersion', 0, '17.7.0'
+            UNION ALL SELECT 3, 'Language', 0, 'English (United States)'
+            UNION ALL SELECT 4, 'Platform', 0, 'Linux'
+        $sql$;
         ALTER PROCEDURE master_dbo.xp_msver() OWNER TO :"usr";
-
-        CREATE OR REPLACE FUNCTION master_dbo.postgis_version()
-        RETURNS TEXT 
-        LANGUAGE plpgsql 
-        SECURITY DEFINER
-        SET search_path = public, pg_temp
-        AS \$\$
-        BEGIN
-            RETURN postgis_version();
-        END;
-        \$\$;
-        ALTER FUNCTION master_dbo.postgis_version() OWNER TO :"usr";
-
-        -- ИСПРАВЛЕНИЕ: SECURITY DEFINER + SET search_path
-        CREATE OR REPLACE FUNCTION master_dbo.st_distance_geography(TEXT, TEXT)
-        RETURNS DOUBLE PRECISION 
-        LANGUAGE plpgsql 
-        SECURITY DEFINER
-        SET search_path = public, pg_temp
-        AS \$\$
-        BEGIN
-            RETURN ST_Distance(
-                ST_GeographyFromText(\$1),
-                ST_GeographyFromText(\$2)
-            );
-        END;
-        \$\$;
-        ALTER FUNCTION master_dbo.st_distance_geography(TEXT, TEXT) OWNER TO :"usr";
 SQL
 
+    if [ "$ENABLE_POSTGIS" = "true" ]; then
+        echo "[entrypoint] Добавляю T-SQL обёртки для PostGIS в master_dbo"
+        # PostGIS живёт в схеме public, а T-SQL-код в Babelfish работает в
+        # своей схемной модели (dbo/master_dbo/...) без public в search_path
+        # по умолчанию — без обёрток вызовы вроде ST_Distance(...) из T-SQL
+        # просто не найдутся. SECURITY DEFINER + явный SET search_path решает
+        # это точечно, функция за функцией. Ниже — только два примера для
+        # иллюстрации паттерна, а не полное покрытие API PostGIS; добавляйте
+        # новые обёртки по мере необходимости для тех функций, которые реально
+        # используете.
+        /opt/postgres/bin/psql -v ON_ERROR_STOP=1 --username postgres --dbname "${BABELFISH_DB}" \
+            --set usr="${BABELFISH_USER}" <<-'SQL'
+            CREATE OR REPLACE FUNCTION master_dbo.postgis_version()
+            RETURNS TEXT
+            LANGUAGE plpgsql
+            SECURITY DEFINER
+            SET search_path = public, pg_temp
+            AS $$
+            BEGIN
+                RETURN postgis_version();
+            END;
+            $$;
+            ALTER FUNCTION master_dbo.postgis_version() OWNER TO :"usr";
+
+            CREATE OR REPLACE FUNCTION master_dbo.st_distance_geography(TEXT, TEXT)
+            RETURNS DOUBLE PRECISION
+            LANGUAGE plpgsql
+            SECURITY DEFINER
+            SET search_path = public, pg_temp
+            AS $$
+            BEGIN
+                RETURN ST_Distance(
+                    ST_GeographyFromText($1),
+                    ST_GeographyFromText($2)
+                );
+            END;
+            $$;
+            ALTER FUNCTION master_dbo.st_distance_geography(TEXT, TEXT) OWNER TO :"usr";
+SQL
+    fi
+
     /opt/postgres/bin/pg_ctl -D "$PGDATA" -m fast -w stop
-    
-    echo "[entrypoint] Инициализация Babelfish завершена успешно"
+    echo "[entrypoint] Инициализация завершена"
 }
 
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
@@ -605,11 +664,15 @@ exec /opt/postgres/bin/postgres -D "$PGDATA"
 
 Обратите внимание: `CREATE EXTENSION tds_fdw` только регистрирует сам foreign data wrapper — сервер и логин для конкретного linked server (`CREATE SERVER ... FOREIGN DATA WRAPPER tds_fdw`, `CREATE USER MAPPING ...`) нужно создавать вручную под свои реквизиты подключения, автоматизировать это в entrypoint нельзя.
 
-**Про заглушки GUI-клиентов (`ENABLE_GUI_CLIENT_STUBS`):** это не официально документированная функциональность Babelfish, а самодельный обход конкретных ошибок, с которыми иногда сталкиваются SSMS/Azure Data Studio при подключении (эти инструменты пытаются вызвать `xp_msver`/прочитать `sys.dm_os_windows_info` при коннекте). По умолчанию выключено (`false`) — включайте, только если реально столкнулись с проблемой подключения именно этих клиентов; для `sqlcmd`/`tsql`/обычных приложений не требуется.
+**Про заглушки GUI-клиентов (`xp_msver`):** это не официально документированная функциональность Babelfish, а самодельный обход конкретных ошибок, с которыми сталкиваются SSMS/Azure Data Studio при подключении (эти инструменты вызывают `xp_msver` при коннекте). Создаются безусловно (не через toggle) — это read-only заглушка, ничего не ломает, даже если конкретным клиентом не пользуетесь.
 
-**Про `password_encryption = 'md5'`:** это наиболее вероятная причина, почему T-SQL/TDS-функционал ещё не был подтверждён рабочим в более ранних итерациях этого гайда (см. раздел 28) — TDS как wire-протокол не умеет в SCRAM. Сама эта гипотеза пока тоже не проверена end-to-end реальным TDS-подключением — проверьте после разворачивания и обновите раздел 28, если что-то не сойдётся.
+**Про `GRANT ALL ON SCHEMA dbo` — почему его здесь нет:** в более ранней версии этого гайда такой блок стоял **до** `CALL SYS.INITIALIZE_BABELFISH` и падал бы с `schema "dbo" does not exist` — эта схема создаётся только самой процедурой. Явный `GRANT` после неё тоже не нужен: `INITIALIZE_BABELFISH` делает переданного пользователя sysadmin-эквивалентом, что уже даёт полный доступ.
 
-**Важно про порядок:** пароль суперпользователя ставится через `--pwfile` **на этапе `initdb`**, до какого-либо `psql`-подключения. Не переставляйте это на `ALTER USER postgres PASSWORD ...` через `psql` сразу после `initdb`, но до `pg_ctl start` — сервер в этот момент ещё не запущен, `psql` не сможет подключиться, скрипт упадёт на `set -e`, а `PG_VERSION` уже будет создан — при следующем перезапуске контейнера entrypoint решит, что кластер уже проинициализирован, и молча пропустит весь блок.
+**Про `babelfishpg_tsql.database_name`/`migration_mode` в `postgresql.conf`, а не через `ALTER SYSTEM`:** гипотеза (не проверенная мной независимо на 100%, но правдоподобная) — если это GUC с контекстом `PGC_POSTMASTER` (применяется только при старте процесса), то `ALTER SYSTEM` + `pg_reload_conf()` не активирует его для уже запущенного постмастера. Записывать сразу в файл — более простой и надёжный порядок в любом случае.
+
+**Про `password_encryption = 'md5'`:** вероятная причина, почему T-SQL/TDS-функционал не был подтверждён в более ранних итерациях (раздел 28) — TDS как wire-протокол не умеет в SCRAM. Проверьте после разворачивания и обновите раздел 28.
+
+**Важно про порядок initdb:** пароль суперпользователя ставится через `--pwfile` на этапе `initdb`, до какого-либо `psql`-подключения. Не переставляйте на `ALTER USER postgres PASSWORD ...` через `psql` до `pg_ctl start` — сервер ещё не запущен, скрипт упадёт на `set -e`, а `PG_VERSION` уже будет создан — при следующем перезапуске entrypoint решит, что кластер проинициализирован, и молча пропустит весь блок.
 
 ```bash
 chmod +x entrypoint.sh
@@ -965,15 +1028,34 @@ Babelfish умеет транслировать T-SQL типы `geometry`/`geogr
 - runtime-этап содержит рантайм-версии `geos`/`proj`/`gdal` без `-devel`;
 - `entrypoint.sh` (раздел 7) выполняет `CREATE EXTENSION postgis` при первой инициализации базы, если не отключено.
 
-### 21.1. Как отключить, если PostGIS не нужен
+### 21.1. Вызов функций PostGIS напрямую из T-SQL — нужен мост между схемами
+
+PostGIS-функции (`ST_Distance`, `postgis_version()` и т.д.) живут в схеме `public`, а T-SQL-код в Babelfish выполняется в своей схемной модели (`dbo`/`master_dbo`/...) без `public` в `search_path` по умолчанию — прямой вызов вроде `ST_Distance(...)` из T-SQL не найдёт функцию. `entrypoint.sh` (раздел 7) создаёт обёртки-примеры в `master_dbo` (`master_dbo.postgis_version()`, `master_dbo.st_distance_geography()`) через `SECURITY DEFINER` + явный `SET search_path = public, pg_temp`:
+
+```sql
+CREATE OR REPLACE FUNCTION master_dbo.st_distance_geography(TEXT, TEXT)
+RETURNS DOUBLE PRECISION
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+    RETURN ST_Distance(ST_GeographyFromText($1), ST_GeographyFromText($2));
+END;
+$$;
+```
+
+Это только два примера для иллюстрации паттерна, не полное покрытие API PostGIS — добавляйте новые обёртки по мере необходимости под те функции, которые реально используете. `SECURITY DEFINER` означает, что функция выполняется с правами владельца (обычно `babelfish_user`), а не вызывающего — для read-only геометрических вычислений риск минимален, но держите это в уме, если будете добавлять обёртки для функций, изменяющих данные.
+
+### 21.2. Как отключить, если PostGIS не нужен
 
 ```ini
 Environment=ENABLE_POSTGIS=false
 ```
 
-в Quadlet-юните — сама библиотека останется в образе, просто `CREATE EXTENSION` не выполнится. Полностью убрать из образа (уменьшить размер) — вырезать соответствующие пакеты и шаг сборки PostGIS из `Containerfile`, с пересборкой.
+в Quadlet-юните — сама библиотека останется в образе, просто `CREATE EXTENSION` и создание T-SQL обёрток (раздел 21.1) не выполнятся. Полностью убрать из образа (уменьшить размер) — вырезать соответствующие пакеты и шаг сборки PostGIS из `Containerfile`, с пересборкой.
 
-### 21.2. Проверка
+### 21.3. Проверка
 
 ```sql
 SELECT geometry::STGeomFromText('POINT(1 1)', 4326).STAsText();
@@ -981,7 +1063,7 @@ SELECT geometry::STGeomFromText('POINT(1 1)', 4326).STAsText();
 
 Должно вернуть `POINT (1 1)` без ошибок о неизвестном типе.
 
-### 21.3. Известные ограничения
+### 21.4. Известные ограничения
 
 - Поддерживаются не все геопространственные функции T-SQL — конкретный список зависит от версии Babelfish.
 - Версию PostGIS привязывайте к тому, что реально тестировалось с вашей версией Babelfish — расхождения версий GEOS/PROJ иногда меняют точность вычислений на границах координатной сетки.
@@ -1128,12 +1210,21 @@ jobs:
 
 ## 28. Статус и открытые вопросы
 
-**Статус:** `Containerfile` (раздел 6) — подтверждённо рабочая **сборка** (`podman build` проходит от `git clone` до финального образа без ошибок на всех четырёх расширениях, PostGIS и tds_fdw). `entrypoint.sh` (раздел 7, более ранняя версия без `md5`) подтверждённо **успешно запускается**: контейнер стартует, инициализация кластера через `entrypoint.sh` проходит целиком без падений (значит, все вызовы `psql` внутри скрипта отработали — в том числе это косвенно подтверждает, что `readline`/`zlib` в runtime не были проблемой). **Не подтверждено:** реальное T-SQL/TDS-подключение (`sqlcmd`/`tsql`/SSMS на порт 1433) и работоспособность `password_encryption = 'md5'` конкретно для этого — это гипотеза, устраняющая известное ограничение TDS-протокола (несовместимость с SCRAM-SHA-256), но ещё не проверенная end-to-end.
+**Статус:** `Containerfile` (раздел 6) — подтверждённо рабочая **сборка**. `entrypoint.sh` (раздел 7) в целом подтверждён рабочим на уровне запуска контейнера и инициализации кластера (более ранняя версия, до текущих правок с `md5`/порядком GUC/схемными вопросами). Текущая версия раздела 7 включает несколько правок поверх подтверждённой базы, которые сами по себе пока не проверены end-to-end реальным TDS-подключением:
+
+- `password_encryption = 'md5'` вместо `scram-sha-256` — устраняет известное ограничение TDS-протокола (несовместимость со SCRAM);
+- `babelfishpg_tsql.database_name`/`migration_mode` записаны в `postgresql.conf` до первого старта, а не выставлены позже через `ALTER SYSTEM`;
+- убран ошибочный `GRANT ALL ON SCHEMA dbo` до `CALL SYS.INITIALIZE_BABELFISH` (эта схема создаётся только самой процедурой — GRANT до неё гарантированно падает);
+- T-SQL обёртки для PostGIS (`master_dbo.postgis_version()` и т.д.) — новая функциональность, не проверенная в реальном T-SQL сеансе.
+
+**Главный следующий шаг** — реальное T-SQL/TDS-подключение и хотя бы один запрос через `tsql`/`sqlcmd`, желательно ещё и вызов `master_dbo.postgis_version()` для проверки моста к PostGIS.
 
 Открытые вопросы, требующие вашего решения или проверки:
 
 1. **Включение PostGIS/tds_fdw в БД по умолчанию.** Сейчас `entrypoint.sh` делает `CREATE EXTENSION` автоматически. Если хотите включать вручную под конкретную задачу — поменяйте дефолт на `false` в переменных `ENABLE_POSTGIS`/`ENABLE_TDS_FDW`.
 2. **Секреты через env-файл vs `podman secret`.** Гайд использует env-файл (раздел 10.1) как более простой вариант. Для более строгого изолирования секретов — доработайте `entrypoint.sh` под `*_FILE`-переменные и переходите на `podman secret` (раздел 10.2).
-3. **T-SQL/TDS-подключение — главный оставшийся непроверенный пункт.** После деплоя обязательно проверьте `tsql -H <host> -p 1433 -U babelfish_user -P '<пароль>'` (раздел 15/17) и хотя бы один реальный T-SQL-запрос. Если подключение не проходит — первое, что проверять: действительно ли `password_encryption = 'md5'` применился (`SHOW password_encryption;` внутри контейнера) и совпадает ли метод в `pg_hba.conf` с тем, что реально шлёт клиент.
-4. **Суффикс `-5` в символических ссылках `babelfishpg_tsql-5.so`/`babelfishpg_common-5.so` (раздел 6).** Подобран под `BABEL_5_4_0` по аналогии с номером релиза — не подтверждён как официально документированное правило именования Babelfish. Контейнер с этими симлинками успешно прошёл инициализацию, что говорит в пользу того, что они как минимум не мешают; но не проверено, действительно ли они были *необходимы*, или расширения загрузились бы и без них. При смене версии Babelfish перепроверяйте по факту ошибки `could not access file`, если она возникнет.
-5. **`ENABLE_GUI_CLIENT_STUBS` (заглушки `xp_msver`/`sys.dm_os_windows_info`).** Неофициальный обход под конкретные GUI-клиенты, выключен по умолчанию. Включайте только если реально столкнулись с проблемой подключения SSMS/Azure Data Studio.
+3. **T-SQL/TDS-подключение — главный оставшийся непроверенный пункт.** После деплоя проверьте `tsql -H <host> -p 1433 -U babelfish_user -P '<пароль>'` (раздел 15/17) и хотя бы один реальный T-SQL-запрос. Если подключение не проходит — проверить `SHOW password_encryption;` и соответствующую запись в `pg_hba.conf`.
+4. **`babelfishpg_tsql.database_name`/`migration_mode` в `postgresql.conf` до старта, а не через `ALTER SYSTEM`.** Логика правдоподобна (см. пояснение в шапке `entrypoint.sh`, раздел 7), но я не смог независимо на 100% подтвердить механизм — не исключаю, что оба подхода на самом деле эквивалентны, раз финальный `postgres`-процесс в любом случае стартует с нуля после `entrypoint.sh`. Не помешает в любом случае, но точная причина не железно доказана.
+5. **Суффикс `-5` в символических ссылках `babelfishpg_tsql-5.so`/`babelfishpg_common-5.so` (раздел 6).** Подобран под `BABEL_5_4_0` по аналогии с номером релиза — не подтверждён как официально документированное правило именования Babelfish. Контейнер с этими симлинками успешно проходил инициализацию, но не проверено, были ли они действительно *необходимы*. При смене версии Babelfish перепроверяйте по факту ошибки `could not access file`.
+6. **Заглушки `xp_msver` под GUI-клиенты.** Неофициальный обход под SSMS/Azure Data Studio, создаются безусловно (без toggle) — read-only, ничем не рискуют, даже если конкретным клиентом не пользуетесь.
+7. **T-SQL обёртки PostGIS в `master_dbo`** (раздел 21.1) — иллюстративный пример на две функции, не полное покрытие API. Расширяйте по необходимости под свои задачи.
